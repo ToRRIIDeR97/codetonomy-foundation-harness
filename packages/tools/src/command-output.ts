@@ -40,6 +40,22 @@ export const TOOL_OUTPUT_READ_LIMIT_BYTES = 16 * 1024;
 export const TOOL_OUTPUT_MANIFEST = "tool-output-manifest.json";
 export const COMMAND_OUTPUT_ROOT = join(realpathSync.native(tmpdir()), ".codetonomy-output");
 const TOOL_OUTPUT_MANIFEST_LIMIT_BYTES = 1024 * 1024;
+
+/**
+ * Creates the shared command-output root as a private directory. Sandboxed commands deny this path;
+ * on Linux, bubblewrap covers a denied path that does not exist yet with an empty read-only
+ * placeholder file and can leave it behind, which would block the directory for every later run.
+ * So the root is created before any sandbox starts, and such a placeholder (an empty regular file
+ * owned by this user) is replaced.
+ */
+export async function ensureCommandOutputRoot(): Promise<void> {
+	const existing = await lstat(COMMAND_OUTPUT_ROOT).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+	if (existing?.isFile() && existing.size === 0 && existing.nlink === 1 && (process.getuid === undefined || existing.uid === process.getuid())) await unlink(COMMAND_OUTPUT_ROOT);
+	await mkdir(COMMAND_OUTPUT_ROOT, { recursive: true, mode: 0o700 });
+	const root = await lstat(COMMAND_OUTPUT_ROOT);
+	if (!root.isDirectory() || root.isSymbolicLink() || await realpath(COMMAND_OUTPUT_ROOT) !== COMMAND_OUTPUT_ROOT) throw new Error("Command output root is not private");
+	await chmod(COMMAND_OUTPUT_ROOT, 0o700);
+}
 const MAX_COMMAND_OUTPUTS = 2_048;
 const MAX_ORIGIN_CALL_ID_BYTES = 16 * 1024;
 const REDACTION_BOUNDARY_BYTES = 64;
@@ -605,12 +621,8 @@ export class CommandOutputStore {
 	async #ensureDirectory(): Promise<void> {
 		if (this.#directoryCreated) return this.#verifyDirectory();
 		const parent = dirname(this.outputDirectory);
-		if (parent === COMMAND_OUTPUT_ROOT) {
-			await mkdir(COMMAND_OUTPUT_ROOT, { recursive: true, mode: 0o700 });
-			const root = await lstat(COMMAND_OUTPUT_ROOT);
-			if (!root.isDirectory() || root.isSymbolicLink() || await realpath(COMMAND_OUTPUT_ROOT) !== COMMAND_OUTPUT_ROOT) throw new Error("Command output root is not private");
-			await chmod(COMMAND_OUTPUT_ROOT, 0o700);
-		} else await realpath(parent);
+		if (parent === COMMAND_OUTPUT_ROOT) await ensureCommandOutputRoot();
+		else await realpath(parent);
 		await mkdir(this.outputDirectory, { mode: 0o700 });
 		const info = await lstat(this.outputDirectory);
 		if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Command output directory is not private");

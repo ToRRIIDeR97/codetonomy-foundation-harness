@@ -103,8 +103,17 @@ An approval-gated module tool that does work on the run's behalf (like
 `delegate_tasks` starting child runs) reports it back to the core: `changedPaths`
 in its result details count as the run's own workspace changes, and
 `additionalUsage` is added to the run's usage. A failing tool throws
-`ModuleToolError(message, additionalUsage)` so its spend is still reported.
-`RunResult.changedPaths` lists the files a run changed.
+`ModuleToolError(message, additionalUsage)` so its spend is still reported, and may
+attach `details` with `changedPaths` and `recoveryScopes`: the units of work the call
+attempted. A later successful call whose scopes include a failed call's scopes
+resolves that failure. `RunResult.changedPaths` lists the files a run changed.
+
+`delegate_tasks` rejects a preset whose permission profile differs from the declared
+one before any child runs. A verified result is plain text with each child's output
+once. A failed one keeps the completed children's verified output and changed files.
+Children inherit the parent's cache, context and nudge settings, and siblings with the
+same preset and write scope wait (up to 30 seconds) for the first one's first
+response, so they read its provider cache entry instead of writing their own.
 
 ## Tests
 

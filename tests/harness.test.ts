@@ -146,7 +146,7 @@ test("delegation remains approval-gated for read and write profiles", async () =
 	const output = await tool.execute("delegation", {
 		nodes: [{ id: "child", objective: "Do the bounded task", presetId: "general-assistant", permissionProfileId: "workspace-read" }],
 	});
-	assert.match(output.content[0]?.type === "text" ? output.content[0].text : "", /"verificationPassed": true/);
+	assert.match(output.content[0]?.type === "text" ? output.content[0].text : "", /^Delegation verified: 1 of 1 children completed\.\n- child: completed \(run [0-9a-f-]{36}\)\n\n## child\n\n/);
 	assert.match(output.content[0]?.type === "text" ? output.content[0].text : "", /Fixture agent completed: Do the bounded task/);
 	await assert.rejects(
 		tool.execute("invalid-preset", {

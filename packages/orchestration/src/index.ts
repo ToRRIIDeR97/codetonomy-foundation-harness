@@ -117,13 +117,26 @@ async function validatePlan(options: OrchestrationOptions): Promise<ValidatedPla
 
 const MAXIMUM_CHILD_ERROR_BYTES = 2_000;
 
-// Cuts text to at most maximumBytes UTF-8 bytes on a character boundary, marking the cut with an ellipsis.
-const clipUtf8 = (text: string, maximumBytes: number): string => {
+/** Cuts text to at most maximumBytes UTF-8 bytes on a character boundary, marking the cut with an ellipsis. */
+export const clipUtf8 = (text: string, maximumBytes: number): string => {
 	const bytes = Buffer.from(text);
 	if (bytes.length <= maximumBytes) return text;
-	let end = Math.max(0, maximumBytes - 3);
+	const marker = maximumBytes >= 3 ? "…" : "";
+	let end = Math.max(0, maximumBytes - Buffer.byteLength(marker));
 	while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end--;
-	return `${bytes.subarray(0, end).toString("utf8")}…`;
+	return `${bytes.subarray(0, end).toString("utf8")}${marker}`;
+};
+
+/** Byte allowances that fit texts into one shared budget: short texts stay whole and long ones share the rest equally. */
+export const shareUtf8Budget = (texts: readonly string[], budget: number): number[] => {
+	const allowed: number[] = [];
+	let remaining = Math.max(0, budget);
+	const bySize = texts.map((text, index) => ({ index, bytes: Buffer.byteLength(text) })).sort((left, right) => left.bytes - right.bytes);
+	for (const [position, { index, bytes }] of bySize.entries()) {
+		allowed[index] = Math.min(bytes, Math.floor(remaining / (bySize.length - position)));
+		remaining -= allowed[index]!;
+	}
+	return allowed;
 };
 
 // Names the first failing checks so the parent can tell why a child's run was rejected.
@@ -150,15 +163,21 @@ export async function runOrchestration(options: OrchestrationOptions): Promise<O
 		}));
 		const promise = (async () => {
 			await emit("subagent.started", { childId: node.id, presetId: node.presetId, writeClaim: claim });
+			let run: RunResult;
 			try {
-				const run = await options.execute(node, { delegationDepth: 1, writeClaim: claim, verifiedDependencies, signal: options.signal });
-				if (run.capabilities.preset.id !== node.presetId) throw new Error(`Child changed preset from ${node.presetId} to ${run.capabilities.preset.id}`);
-				if (run.capabilities.permissionProfileId !== node.permissionProfileId) throw new Error(`Child changed permission profile from ${node.permissionProfileId} to ${run.capabilities.permissionProfileId}`);
-				if (!run.verification.passed) return { id: node.id, run, error: new Error(verificationFailure(run.verification)) };
-				return { id: node.id, run, verified: true };
+				run = await options.execute(node, { delegationDepth: 1, writeClaim: claim, verifiedDependencies, signal: options.signal });
 			} catch (error) {
 				return { id: node.id, error };
 			}
+			// A run that finished is kept even when it is rejected, so its id and usage still reach the caller.
+			const changed = run.capabilities.preset.id !== node.presetId
+				? `Child changed preset from ${node.presetId} to ${run.capabilities.preset.id}`
+				: run.capabilities.permissionProfileId !== node.permissionProfileId
+					? `Child changed permission profile from ${node.permissionProfileId} to ${run.capabilities.permissionProfileId}`
+					: undefined;
+			if (changed) return { id: node.id, run, error: new Error(changed) };
+			if (!run.verification.passed) return { id: node.id, run, error: new Error(verificationFailure(run.verification)) };
+			return { id: node.id, run, verified: true };
 		})();
 		active.set(node.id, promise);
 	};

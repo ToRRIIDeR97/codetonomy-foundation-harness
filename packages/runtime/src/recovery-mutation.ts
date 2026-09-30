@@ -22,6 +22,8 @@ export interface RecoverableToolError {
 	proposalFingerprint?: string;
 	proposalEventId?: string;
 	proposalSourceRevision?: string;
+	/** Units of work a failed approval-gated module tool call attempted; see HarnessModuleTool. */
+	recoveryScopes?: string[];
 	resolved?: boolean;
 }
 
