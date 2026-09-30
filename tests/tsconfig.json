@@ -1,0 +1,17 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "@agent-harness/*": ["../packages/*/src/index.ts"],
+      "@earendil-works/pi-ai": ["../packages/runtime/node_modules/@earendil-works/pi-ai/dist/index.d.ts"],
+      "@earendil-works/pi-agent-core": ["../packages/runtime/node_modules/@earendil-works/pi-agent-core/dist/index.d.ts"]
+    }
+  },
+  "include": ["**/*.ts"]
+}

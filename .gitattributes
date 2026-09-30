@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+# Recorded trial output: model-generated apps, request records and logs.
+live-projects/*/run*/** linguist-generated
+live-projects/*/preflight*/** linguist-generated

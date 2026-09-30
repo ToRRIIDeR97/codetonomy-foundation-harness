@@ -1,0 +1,64 @@
+schema_version: 1
+
+components:
+  - id: pi-agent-runtime
+    source_repository: earendil-works/pi
+    source_commit: 2e4d23959485279aa2da1a45103de2ea22d46395
+    source_paths:
+      - packages/agent
+      - packages/ai
+    destination:
+      - package.json
+      - packages/runtime/src/index.ts
+      - patches/@earendil-works__pi-ai@0.84.1.patch
+      - packages/tools/package.json
+      - packages/tools/src/index.ts
+      - packages/module-memorydb/package.json
+      - packages/module-orchestration/package.json
+    license: MIT
+    integration_method: direct_dependency
+    package_versions:
+      "@earendil-works/pi-agent-core": 0.84.1
+      "@earendil-works/pi-ai": 0.84.1
+    modifications:
+      - Strict JSON tool finalization for OpenAI Completions, Responses, and Anthropic; preserve raw-input tools and streaming previews.
+      - Reject invalid final calls at existing schema validation; emit bounded provider attempt and retry callbacks.
+    tests:
+      - tests/harness.test.ts
+      - tests/tool-repair.test.ts
+      - tests/provider-conformance.test.ts
+  - id: pi-opencode-model-catalog
+    source_repository: earendil-works/pi
+    source_commit: 2e4d23959485279aa2da1a45103de2ea22d46395
+    source_paths:
+      - packages/ai/scripts/generate-models.ts
+    destination:
+      - packages/config/src/index.ts
+      - packages/runtime/src/index.ts
+    license: MIT
+    integration_method: adapted_source
+    package_versions:
+      "@earendil-works/pi-ai": 0.84.1
+    modifications:
+      - Intersect the authenticated OpenCode Go model list with live models.dev metadata, persist selected metadata, and retain Pi's provider protocol overrides for MiniMax, Qwen, Kimi, and DeepSeek.
+      - Extend the metadata boundary to compatible local endpoints; add GLM Flash reasoning compatibility and the documented OpenCode Go session and client headers without replacing Pi's HTTP adapters.
+    tests:
+      - tests/cli.test.ts
+      - tests/provider-conformance.test.ts
+      - tests/small-model-foundation.test.ts
+  - id: reasonix-query-snippet
+    source_repository: esengine/deepseek-reasonix
+    source_commit: 63dae234b27fdf28b0661239bfbaa61ab14435af
+    source_paths:
+      - internal/retrieval/bm25.go
+      - internal/tool/builtin/codeindex.go
+    destination:
+      - packages/tools/src/index.ts
+    license: MIT
+    integration_method: adapted_source
+    package_versions: {}
+    modifications:
+      - Port MakeSnippet to TypeScript and retain the match offset for workspace line references.
+      - Adapt the bounded multi-language regex symbol fallback to attach enclosing symbol metadata to existing workspace chunks without adding tree-sitter.
+    tests:
+      - tests/harness.test.ts

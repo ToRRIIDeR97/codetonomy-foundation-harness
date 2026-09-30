@@ -1,0 +1,25 @@
+{
+  "name": "codetonomy-foundation-harness",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "The core Codetonomy agent harness: runtime, compilers, tools, permissions, verifiers and telemetry, without any client, UI, memory or OCR component.",
+  "type": "module",
+  "packageManager": "pnpm@11.16.0",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "check": "tsc -b --pretty false && tsc -p scripts --pretty false && tsc -p tests --pretty false && tsc -p examples --pretty false",
+    "test": "npm run build && npm run test:only",
+    "test:only": "node --import tsx --test tests/*.test.ts",
+    "test:file": "node --import tsx --test",
+    "test:sandbox": "node --import tsx --test tests/sandbox-conformance.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "tsx": "4.22.1",
+    "typescript": "5.9.3"
+  }
+}

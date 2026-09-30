@@ -1,0 +1,38 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/contracts"
+    },
+    {
+      "path": "packages/telemetry"
+    },
+    {
+      "path": "packages/task-compiler"
+    },
+    {
+      "path": "packages/capability-compiler"
+    },
+    {
+      "path": "packages/permissions"
+    },
+    {
+      "path": "packages/context-compiler"
+    },
+    {
+      "path": "packages/orchestration"
+    },
+    {
+      "path": "packages/tools"
+    },
+    {
+      "path": "packages/verifiers"
+    },
+    {
+      "path": "packages/runtime"
+    },
+    {
+      "path": "packages/module-orchestration"
+    }
+  ]
+}

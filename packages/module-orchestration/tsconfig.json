@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "references": [
+    { "path": "../contracts" },
+    { "path": "../orchestration" },
+    { "path": "../runtime" },
+    { "path": "../telemetry" },
+    { "path": "../tools" }
+  ],
+  "include": ["src/**/*.ts"]
+}

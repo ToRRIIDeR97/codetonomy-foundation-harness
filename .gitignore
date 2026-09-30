@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.harness/
+.codetonomy/
+.codetonomy-sandbox-*/
+.pnpm-store/
+.DS_Store
+.env

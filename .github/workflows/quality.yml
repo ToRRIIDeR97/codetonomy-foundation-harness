@@ -1,0 +1,56 @@
+name: quality
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: npm run check
+  test:
+    timeout-minutes: 30
+    env:
+      CODETONOMY_WORKER_ROOT: ${{ github.workspace }}/.codetonomy/workers
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
+      - name: Enable unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - if: runner.os == 'macOS'
+        run: brew install ripgrep
+      - if: runner.os == 'Windows'
+        run: choco install ripgrep --yes --no-progress
+      - run: pnpm install --frozen-lockfile
+      - run: npm run build
+      - run: node scripts/install-codex.mjs
+      - run: npm run test:only
+        env:
+          CODETONOMY_CODEX_BIN: ${{ runner.os == 'Windows' && format('{0}\\.codetonomy\\workers\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe', github.workspace) || format('{0}/.codetonomy/workers/codex/node_modules/.bin/codex', github.workspace) }}
