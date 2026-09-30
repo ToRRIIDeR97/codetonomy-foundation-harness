@@ -1021,6 +1021,9 @@ export function createHarness(): AgentHarness {
 						approve: options.approve,
 						providerFetch: options.providerFetch,
 						cacheAffinityId: options.cacheAffinityId,
+						cacheRetention: options.cacheRetention,
+						contextRetentionTokens: options.contextRetentionTokens,
+						actionNudgeMode: options.actionNudgeMode,
 						toolInterface: options.toolInterface,
 						...(options.modules ? { modules: options.modules } : {}),
 						contextTokenBudget: options.contextTokenBudget,
@@ -2110,14 +2113,37 @@ export function createHarness(): AgentHarness {
 							})
 							: { eligible: false, reason: "successful-tool-result" };
 						const sourceRevision = workerEligibility.eligible ? await sourceRevisionFor(target, repairTargetRevision) : undefined;
+						// Units of work an approval-gated module tool call attempted (delegated child ids): a later
+						// successful call of the same tool that covers a failed call's scopes resolves that failure.
+						const moduleScopes = reportingModuleToolIds.has(canonicalToolId) && Array.isArray(resultDetails?.recoveryScopes)
+							? resultDetails.recoveryScopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0)
+							: [];
+						// Verified work a module ran for this run (delegated child runs) counts as this run's change and
+						// spend. A failed call's usage arrives through ModuleToolError (onModuleToolFailureUsage) instead.
+						const creditModuleWork = async (includeUsage: boolean): Promise<void> => {
+							if (!reportingModuleToolIds.has(canonicalToolId)) return;
+							for (const path of Array.isArray(resultDetails?.changedPaths) ? resultDetails.changedPaths : []) {
+								if (typeof path !== "string" || !path) continue;
+								const target = targetPath({ path })!;
+								if (!isWorkspaceTarget(target)) continue;
+								const revision = await revisionOf(target);
+								if (revision === "protected") continue;
+								fileEvidence.push({ target, action: revision === "absent" ? "delete" : "write", callId: event.toolCallId, current: revision !== "unknown", revision, modelTurn: modelTurns });
+								workspaceRevision++;
+							}
+							if (includeUsage) addReportedUsage(usage, resultDetails?.additionalUsage);
+						};
 						if (event.isError && !activeTools.some(({ name }) => name === event.toolName)) {
 							// The model already receives the not-found result and the tool list, so a
 							// guessed name such as "write" is correctable; only repeated guessing ends the run.
 							unknownToolCalls++;
 							if (unknownToolCalls > MAX_UNKNOWN_TOOL_CALLS) recordFatalRuntimeError(`Unknown tool called ${unknownToolCalls} times; last was ${event.toolName}`);
 						} else if (event.isError) {
+							// A failed delegation still reports the verified work its completed children did.
+							await creditModuleWork(false);
 							failureCounts.set(key, (failureCounts.get(key) ?? 0) + 1);
 							recoverableToolErrors.set(event.toolCallId, { toolName: canonicalToolId, message: errorMessage ?? `Tool ${event.toolName} failed`, modelRequestId, modelTurn: modelTurns, key, recoveryKey, target, obligationId: obligation?.id, outcome,
+								...(moduleScopes.length ? { recoveryScopes: moduleScopes } : {}),
 								...(workerEligibility.eligible ? { schemaRepair: { toolName: event.toolName, arguments: finalizedCall.arguments } } : {}),
 								...commandRecovery(event.toolCallId, resultDetails) });
 						} else {
@@ -2139,19 +2165,7 @@ export function createHarness(): AgentHarness {
 							completedToolIds.add(canonicalToolId);
 							if (typeof resultDetails?.semanticOperationId === "string") completedToolIds.add(resultDetails.semanticOperationId);
 							successfulTurns.add(modelTurns);
-							if (reportingModuleToolIds.has(canonicalToolId)) {
-								// Verified work a module ran for this run (delegated child runs) counts as this run's change and spend.
-								for (const path of Array.isArray(resultDetails?.changedPaths) ? resultDetails.changedPaths : []) {
-									if (typeof path !== "string" || !path) continue;
-									const target = targetPath({ path })!;
-									if (!isWorkspaceTarget(target)) continue;
-									const revision = await revisionOf(target);
-									if (revision === "protected") continue;
-									fileEvidence.push({ target, action: revision === "absent" ? "delete" : "write", callId: event.toolCallId, current: revision !== "unknown", revision, modelTurn: modelTurns });
-									workspaceRevision++;
-								}
-								addReportedUsage(usage, resultDetails?.additionalUsage);
-							}
+							await creditModuleWork(true);
 							if (canonicalToolId === "run_workspace_command") {
 								for (const path of Array.isArray(resultDetails?.changedPaths) ? resultDetails.changedPaths : []) {
 									if (typeof path !== "string") continue;
@@ -2247,9 +2261,10 @@ export function createHarness(): AgentHarness {
 									tool: activeTool, callId: event.toolCallId, originalArguments: failure.schemaRepair.arguments,
 									proposedArguments: finalizedCall.arguments as Record<string, unknown>, originalTarget: failure.target, targetOf: targetPath,
 								}).valid;
+								const moduleCorrected = failure.toolName === canonicalToolId && Boolean(failure.recoveryScopes?.length) && failure.recoveryScopes!.every((scope) => moduleScopes.includes(scope));
 								const workerCorrected = proposalOrigins.get(event.toolCallId) === callId
 									&& failure.proposalFingerprint === stableHash({ toolName: event.toolName, arguments: finalizedCall.arguments });
-								if ((fulfilled && failure.toolName === canonicalToolId) || sameOperation || reconciledWrite || workerCorrected || primarySchemaCorrected) {
+								if ((fulfilled && failure.toolName === canonicalToolId) || sameOperation || reconciledWrite || moduleCorrected || workerCorrected || primarySchemaCorrected) {
 									failure.resolved = true;
 									await trace.emit("tool.failure.resolved", { failureId: failure.eventId, originatingCallId: callId, correctingCallId: event.toolCallId, correctingEventId: completedEvent.eventId, obligationId: failure.obligationId, repairClass: workerCorrected ? "worker-correction" : reconciledWrite ? "reconciliation" : "model-correction", ...(workerCorrected ? { proposalEventId: failure.proposalEventId, workerAssisted: true } : {}) }, failure.eventId);
 								}

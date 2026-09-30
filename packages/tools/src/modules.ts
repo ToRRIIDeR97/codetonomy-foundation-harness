@@ -29,7 +29,15 @@ export interface HarnessModuleRunContext {
 
 export interface HarnessModuleTool {
 	definition: HarnessModuleToolDefinition;
-	/** "read" tools are allowed under any workspace profile; "approval" tools ask first. */
+	/**
+	 * "read" tools are allowed under any workspace profile; "approval" tools ask first. An
+	 * "approval" tool may report work it ran on the run's behalf in its result `details`:
+	 * `changedPaths` (workspace files it changed, credited as the run's writes), `additionalUsage`
+	 * (model usage added to the run's usage) and `recoveryScopes` (ids of the units of work the
+	 * call attempted; a later successful call whose scopes include every scope of a failed call
+	 * resolves that failure). A failing call throws ModuleToolError for its usage and may attach
+	 * `details` with `changedPaths` and `recoveryScopes` to that error.
+	 */
 	access: "read" | "approval";
 	/** Default true. False keeps the tool out of delegated child runs, including carried session tools. */
 	offerInChildRuns?: boolean;

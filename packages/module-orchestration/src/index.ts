@@ -7,9 +7,9 @@ import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
-import { redactAuditString, type HarnessEventType, type RunResult, type RunUsage, type VerificationResult } from "@agent-harness/contracts";
-import { runOrchestration, type OrchestrationNode, type OrchestrationResult } from "@agent-harness/orchestration";
-import { createHarness, resolveToolInterface, runtimeKnownSecrets, writeRuntimeFileAtomically, type HarnessModule, type HarnessModuleRunContext, type HarnessRunOptions } from "@agent-harness/runtime";
+import { redactAuditString, type HarnessEvent, type HarnessEventType, type RunResult, type RunUsage, type VerificationResult } from "@agent-harness/contracts";
+import { clipUtf8, MAXIMUM_CHILDREN_PER_RUN, MAXIMUM_DELEGATION_DEPTH, MAXIMUM_PARALLEL_WRITERS, runOrchestration, shareUtf8Budget, type OrchestrationNode, type OrchestrationResult } from "@agent-harness/orchestration";
+import { cacheCapabilitiesForProvider, createHarness, resolveToolInterface, runtimeKnownSecrets, writeRuntimeFileAtomically, type HarnessModule, type HarnessModuleRunContext, type HarnessProviderKind, type HarnessRunOptions } from "@agent-harness/runtime";
 import { RunTrace } from "@agent-harness/telemetry";
 import { ModuleToolError, truncateUtf8 } from "@agent-harness/tools";
 
@@ -20,6 +20,43 @@ export const DELEGATABLE_PRESET_IDS = [
 	"general-worker",
 ] as const;
 export type DelegatablePresetId = (typeof DELEGATABLE_PRESET_IDS)[number];
+
+/** The permission profile each delegatable preset runs under; the capability compiler fixes it per preset. */
+export const DELEGATABLE_PRESET_PERMISSIONS: Readonly<Record<DelegatablePresetId, "workspace-read" | "workspace-write">> = {
+	"general-assistant": "workspace-read",
+	"general-worker": "workspace-write",
+};
+
+// Rejects a node whose declared profile differs from its preset's before any child runs; a mismatch
+// used to surface only after the child had spent a full run.
+const checkPresetPermissions = (nodes: readonly OrchestrationNode[]): void => {
+	for (const { id, presetId, permissionProfileId } of nodes) {
+		const expected = DELEGATABLE_PRESET_PERMISSIONS[presetId as DelegatablePresetId];
+		if (expected && expected !== permissionProfileId) throw new Error(`Child ${id} uses preset ${presetId}, which runs ${expected}; set permissionProfileId to ${expected}`);
+	}
+};
+
+// Siblings with the same preset and write scope send the same system prompt and tools. Started
+// together, each one pays to write that prefix to the provider cache; instead, the later ones wait
+// for the first one's first response and read it. Anthropic serves a cache entry once a response
+// begins; automatic-prefix providers (DeepSeek, OpenAI) once the request completes. The wait is bounded.
+const CACHE_WARMUP_MAXIMUM_WAIT_MS = 30_000;
+const cacheWarmupGroup = ({ presetId, writePaths }: OrchestrationNode): string => `${presetId}/${writePaths?.length ? "scoped" : "workspace"}`;
+
+const waitForWarmup = async (warm: Promise<void>, maximumWaitMs: number, signal?: AbortSignal): Promise<void> => {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let stop: (() => void) | undefined;
+	try {
+		await Promise.race([warm, new Promise<void>((resolve) => {
+			stop = () => resolve();
+			timer = setTimeout(stop, maximumWaitMs);
+			signal?.addEventListener("abort", stop, { once: true });
+		})]);
+	} finally {
+		clearTimeout(timer);
+		if (stop) signal?.removeEventListener("abort", stop);
+	}
+};
 
 export interface DelegateTasksNode {
 	id: string;
@@ -46,6 +83,12 @@ export interface DelegateTasksResult {
 	changedPaths?: string[];
 	/** For the parent runtime, not the model: every child run's usage, summed. */
 	additionalUsage?: RunUsage;
+	/**
+	 * For the parent runtime, not the model: child ids this call settled (on success, the completed
+	 * children) or left to redo (on failure, the failed and skipped children, or every child when
+	 * only the final check failed). A later verified delegation of those ids resolves the failure.
+	 */
+	recoveryScopes?: string[];
 }
 
 const sumUsage = (usages: readonly RunUsage[]): RunUsage => {
@@ -90,6 +133,8 @@ export interface HarnessOrchestrationOptions extends Omit<HarnessRunOptions, "ob
 	synthesize?(verifiedChildren: ReadonlyMap<string, RunResult>, signal?: AbortSignal): Promise<string>;
 	verifyFinal?(output: string, verifiedChildren: ReadonlyMap<string, RunResult>): Promise<VerificationResult>;
 	onSubagentEvent?(type: Extract<HarnessEventType, `subagent.${string}`>, data: Record<string, unknown>): void | Promise<void>;
+	/** Longest a child waits for a same-prefix sibling to warm the provider cache; defaults to 30 seconds, 0 disables. */
+	cacheWarmupMaximumWaitMs?: number;
 }
 
 export interface HarnessOrchestrationResult extends OrchestrationResult {
@@ -111,6 +156,7 @@ export async function runHarnessOrchestration(options: HarnessOrchestrationOptio
 		synthesize,
 		verifyFinal,
 		onSubagentEvent,
+		cacheWarmupMaximumWaitMs = CACHE_WARMUP_MAXIMUM_WAIT_MS,
 		...runOptions
 	} = options;
 	const workspaceRoot = resolve(options.workspaceRoot ?? process.cwd());
@@ -125,18 +171,27 @@ export async function runHarnessOrchestration(options: HarnessOrchestrationOptio
 	const deadlineController = new AbortController();
 	const deadlineTimer = setTimeout(() => deadlineController.abort(new Error("Run deadline exceeded")), Math.max(0, runOptions.runBudgetState.deadline - Date.now()));
 	const signal = AbortSignal.any([deadlineController.signal, ...(options.signal ? [options.signal] : [])]);
+	// Mirrors the runtime's cache resolution: no warm-up without a provider cache or with retention off.
+	const cacheStrategy = options.providerConfiguration?.modelMetadata?.cacheStrategy
+		?? cacheCapabilitiesForProvider((options.providerConfiguration?.kind ?? options.provider ?? "fixture") as HarnessProviderKind | "fixture").strategies[0];
+	const cacheWarmup = cacheWarmupMaximumWaitMs > 0 && cacheStrategy !== "NO_PROVIDER_CACHE"
+		&& (options.cacheRetention ?? options.providerConfiguration?.modelMetadata?.cacheRetention) !== "none";
+	const warmupReadyOn: HarnessEventType = cacheStrategy === "EXPLICIT_BREAKPOINT" ? "model.first_token" : "model.request.completed";
+	const warmups = new Map<string, Promise<void>>();
 
 	try {
 		const runEvent = await trace.emit("run.started", { repairSchemaVersion: 1, workspaceRoot, orchestration: true, permissionMode: options.permissionMode ?? "ask", toolInterface: resolveToolInterface(options) });
 		runEventId = runEvent.eventId;
 		const taskEvent = await trace.emit("task.compiled", { children: nodes }, runEventId);
 		await trace.emit("capabilities.resolved", {
-			maximumDelegationDepth: 1,
-			maximumChildren: 3,
-			maximumParallelWriters: maximumParallelWriters ?? 2,
+			maximumDelegationDepth: MAXIMUM_DELEGATION_DEPTH,
+			maximumChildren: MAXIMUM_CHILDREN_PER_RUN,
+			maximumParallelWriters: maximumParallelWriters ?? MAXIMUM_PARALLEL_WRITERS,
 			parentPermissionProfileId,
 			delegationDepth,
+			cacheWarmup,
 		}, taskEvent.eventId);
+		checkPresetPermissions(nodes);
 		const result = await runOrchestration({
 			workspaceRoot,
 			nodes,
@@ -148,18 +203,30 @@ export async function runHarnessOrchestration(options: HarnessOrchestrationOptio
 				await trace.emit(type, data, runEventId);
 				await onSubagentEvent?.(type, data);
 			},
-			execute: (node, context) => harness.run({
-				...runOptions,
-				spendBudgetState,
-				workspaceRoot,
-				objective: node.objective,
-				files: [...context.verifiedDependencies.values()].flatMap(({ artifacts }) => artifacts.flatMap(({ type, path }) => type === "file" && path ? [path] : [])),
-				verifiedDependencies: context.verifiedDependencies,
-				presetId: node.presetId,
-				writePaths: node.writePaths,
-				delegationDepth: context.delegationDepth,
-				signal: context.signal,
-			}),
+			execute: async (node, context) => {
+				const group = cacheWarmupGroup(node);
+				const leader = cacheWarmup ? warmups.get(group) : undefined;
+				let warmed: (() => void) | undefined;
+				if (cacheWarmup && !leader) warmups.set(group, new Promise<void>((resolve) => { warmed = resolve; }));
+				if (leader) await waitForWarmup(leader, cacheWarmupMaximumWaitMs, context.signal);
+				try {
+					return await harness.run({
+						...runOptions,
+						...(warmed ? { observers: [...(runOptions.observers ?? []), ({ type }: HarnessEvent) => { if (type === warmupReadyOn || type === "model.request.failed") warmed!(); }] } : {}),
+						spendBudgetState,
+						workspaceRoot,
+						objective: node.objective,
+						files: [...context.verifiedDependencies.values()].flatMap(({ artifacts }) => artifacts.flatMap(({ type, path }) => type === "file" && path ? [path] : [])),
+						verifiedDependencies: context.verifiedDependencies,
+						presetId: node.presetId,
+						writePaths: node.writePaths,
+						delegationDepth: context.delegationDepth,
+						signal: context.signal,
+					});
+				} finally {
+					warmed?.();
+				}
+			},
 			synthesize: synthesize ?? (async (children) => [...children.entries()]
 				.map(([id, child]) => `## ${id}\n\n${child.output}`)
 				.join("\n\n")),
@@ -195,16 +262,10 @@ export async function runHarnessOrchestration(options: HarnessOrchestrationOptio
 const DELEGATION_FAILURE = "Delegated child work failed verification";
 // The runtime keeps only the first 2,000 characters of a tool error in the trace and the repair state.
 const MAXIMUM_DELEGATION_FAILURE_BYTES = 2_000;
-
-// Cuts text to at most maximumBytes UTF-8 bytes on a character boundary, marking the cut with an ellipsis.
-const clipUtf8 = (text: string, maximumBytes: number): string => {
-	const bytes = Buffer.from(text);
-	if (bytes.length <= maximumBytes) return text;
-	const marker = maximumBytes >= 3 ? "…" : "";
-	let end = Math.max(0, maximumBytes - Buffer.byteLength(marker));
-	while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end--;
-	return `${bytes.subarray(0, end).toString("utf8")}${marker}`;
-};
+// Model-visible bytes for child outputs (or a custom synthesis) in one delegate_tasks result.
+const MAXIMUM_DELEGATION_OUTPUT_BYTES = 16_000;
+const MAXIMUM_CHILD_OUTPUT_BYTES = 4_000;
+const MAXIMUM_CHILD_ERROR_BYTES = 1_000;
 
 // Names every failed or skipped child as `<id>=<status> (<reason>[; run <runId>])` within the error budget. Only
 // reasons are shortened, and only as far as the shared budget needs, so every id, status and run id survives.
@@ -217,15 +278,18 @@ const delegationFailureMessage = ({ children, verification }: OrchestrationResul
 	const entry = ({ id, status, run }: typeof unfinished[number], reason: string) => `${id}=${status} (${reason}${run ? `; run ${run.runId}` : ""})`;
 	const summary = (reasons: string[]) => `${DELEGATION_FAILURE}: ${unfinished.map((child, index) => entry(child, reasons[index]!)).join("; ")}`;
 	const reasons = unfinished.map(({ error }) => error ?? "No reason recorded");
-	// Water-fill the bytes left after the fixed parts: short reasons stay whole and long ones share the rest equally.
-	let budget = MAXIMUM_DELEGATION_FAILURE_BYTES - Buffer.byteLength(summary(reasons.map(() => "")));
-	const allowed: number[] = [];
-	const bySize = reasons.map((reason, index) => ({ index, bytes: Buffer.byteLength(reason) })).sort((left, right) => left.bytes - right.bytes);
-	for (const [position, { index, bytes }] of bySize.entries()) {
-		allowed[index] = Math.min(bytes, Math.max(0, Math.floor(budget / (bySize.length - position))));
-		budget -= allowed[index]!;
-	}
+	const allowed = shareUtf8Budget(reasons, MAXIMUM_DELEGATION_FAILURE_BYTES - Buffer.byteLength(summary(reasons.map(() => ""))));
 	return summary(reasons.map((reason, index) => clipUtf8(reason, allowed[index]!)));
+};
+
+// `## <id>` sections of verified child output. With a shared budget, short outputs stay whole and
+// long ones share the rest; otherwise each output is clipped to its own limit.
+const outputSections = (runs: ReadonlyArray<{ id: string; output: string }>, budget: { shared: number } | { each: number }): string => {
+	const heading = (id: string) => `## ${id}\n\n`;
+	const allowed = "shared" in budget
+		? shareUtf8Budget(runs.map(({ output }) => output), budget.shared - runs.reduce((total, { id }) => total + Buffer.byteLength(heading(id)) + 2, 0))
+		: runs.map(() => budget.each);
+	return runs.map(({ id, output }, index) => `${heading(id)}${clipUtf8(output, allowed[index]!)}`).join("\n\n");
 };
 
 function delegateTasksTool(run: HarnessModuleRunContext | undefined): AgentTool<typeof delegateTasksParameters> {
@@ -239,39 +303,52 @@ function delegateTasksTool(run: HarnessModuleRunContext | undefined): AgentTool<
 			signal?.throwIfAborted();
 			if (nodes.some(({ presetId }) => !DELEGATABLE_PRESET_IDS.includes(presetId))) throw new Error(`Unknown delegation preset; use one of: ${DELEGATABLE_PRESET_IDS.join(", ")}`);
 			if (!run) throw new Error("delegate_tasks requires a parent run");
-			if (run.depth >= 1) throw new Error("Recursive delegation is disabled");
+			if (run.depth >= MAXIMUM_DELEGATION_DEPTH) throw new Error("Recursive delegation is disabled");
 			if (run.permissionProfileId !== "workspace-read" && run.permissionProfileId !== "workspace-write") throw new Error("Delegation requires a workspace permission profile");
+			checkPresetPermissions(nodes);
+			const inherited = run.inheritedOptions as Omit<HarnessOrchestrationOptions, "nodes" | "parentPermissionProfileId">;
 			const orchestration = await runHarnessOrchestration({
-				...(run.inheritedOptions as Omit<HarnessOrchestrationOptions, "nodes" | "parentPermissionProfileId">),
+				...inherited,
 				nodes: nodes as OrchestrationNode[],
 				parentPermissionProfileId: run.permissionProfileId,
 				...(signal ? { signal } : {}),
 			});
 			signal?.throwIfAborted();
-			const additionalUsage = sumUsage(orchestration.children.flatMap(({ run: child }) => child ? [child.usage] : []));
-			// Failed children still spent tokens on the parent's behalf; the error carries that usage to the parent.
-			if (!orchestration.verification.passed) throw new ModuleToolError(delegationFailureMessage(orchestration), additionalUsage);
-			const children = orchestration.children.slice(0, 3).map(({ id, status, run: child, error }) => ({
-				id,
-				status,
-				...(child ? { runId: child.runId } : {}),
-				...(child?.output ? { output: truncateUtf8(child.output, 4_000).text } : {}),
-				...(error ? { error: truncateUtf8(error, 1_000).text } : {}),
-			}));
-			// Reported to the parent run: files the verified children changed count as its workspace change,
-			// and their usage is part of its usage (the shared spend budget already charged it).
-			const completed = orchestration.children.flatMap(({ status, run: child }) => status === "completed" && child ? [child] : []);
-			const visible = {
-				output: truncateUtf8(orchestration.output, 16_000).text,
-				verificationPassed: orchestration.verification.passed,
-				children,
-			};
+			// Reported to the parent run whether or not the delegation passed: files the verified children
+			// changed count as its workspace change, and every child run's usage is part of its usage (the
+			// shared spend budget already charged it). On failure the usage travels as ModuleToolError's
+			// additionalUsage and the rest in the error's details.
+			const completed = orchestration.children.flatMap(({ id, status, run: child }) => status === "completed" && child ? [{ id, output: child.output, changedPaths: child.changedPaths }] : []);
 			const details: DelegateTasksResult = {
-				...visible,
+				output: truncateUtf8(orchestration.output, MAXIMUM_DELEGATION_OUTPUT_BYTES).text,
+				verificationPassed: orchestration.verification.passed,
+				children: orchestration.children.map(({ id, status, run: child, error }) => ({
+					id,
+					status,
+					...(child ? { runId: child.runId } : {}),
+					...(child?.output ? { output: truncateUtf8(child.output, MAXIMUM_CHILD_OUTPUT_BYTES).text } : {}),
+					...(error ? { error: truncateUtf8(error, MAXIMUM_CHILD_ERROR_BYTES).text } : {}),
+				})),
 				changedPaths: [...new Set(completed.flatMap(({ changedPaths }) => changedPaths ?? []))],
-				additionalUsage,
+				additionalUsage: sumUsage(orchestration.children.flatMap(({ run: child }) => child ? [child.usage] : [])),
 			};
-			const text = truncateUtf8(JSON.stringify(visible, null, 2)).text;
+			const unfinished = orchestration.children.filter(({ status }) => status !== "completed");
+			details.recoveryScopes = orchestration.verification.passed ? completed.map(({ id }) => id) : (unfinished.length ? unfinished : orchestration.children).map(({ id }) => id);
+			if (!orchestration.verification.passed) {
+				// The failure summary comes first and stays within the trace's error budget; verified sibling
+				// output follows so the parent does not redo work that already passed.
+				const kept = completed.length
+					? `\n\nVerified output from the children that completed; their file changes are kept, so do not redo them:\n\n${outputSections(completed, { shared: MAXIMUM_DELEGATION_OUTPUT_BYTES })}`
+					: "";
+				throw Object.assign(new ModuleToolError(`${delegationFailureMessage(orchestration)}${kept}`, details.additionalUsage), { details });
+			}
+			// One line per child, then each output once: the default synthesis is the child outputs, so they are
+			// not repeated; a custom synthesis is shown with the child outputs it was built from.
+			const status = orchestration.children.map(({ id, status: childStatus, run: child }) => `- ${id}: ${childStatus}${child ? ` (run ${child.runId})` : ""}`).join("\n");
+			const body = inherited.synthesize
+				? `${clipUtf8(orchestration.output, MAXIMUM_DELEGATION_OUTPUT_BYTES)}\n\nChild outputs:\n\n${outputSections(completed, { each: MAXIMUM_CHILD_OUTPUT_BYTES })}`
+				: outputSections(completed, { shared: MAXIMUM_DELEGATION_OUTPUT_BYTES });
+			const text = truncateUtf8(`Delegation verified: ${completed.length} of ${orchestration.children.length} children completed.\n${status}\n\n${body}`).text;
 			return { content: [{ type: "text", text }], details };
 		},
 	};

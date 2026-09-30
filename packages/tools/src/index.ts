@@ -10,14 +10,14 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { isSensitiveWorkspacePath, redactAuditString } from "@agent-harness/contracts";
 import { bashInstallationRoot as bashInstallationRootOf, BashCommandPlanner, bashPermissionTarget, bashPermissionTargets, bashPlanUsesReadOnlySandbox, bashPlanUsesTrustedExecution, planBashCommand, resolveBashExecutable, sandboxPlatformDefaultsOverlap, type BashCommandPlan, type BashLeafOperation, type BashOperation, type BashToolArguments } from "./bash-driver.js";
-import { COMMAND_OUTPUT_ROOT, CommandOutputCaptureError, CommandOutputStore, TOOL_OUTPUT_CONTEXT_LINE_LIMIT, TOOL_OUTPUT_PATTERN_LIMIT, TOOL_OUTPUT_READ_LIMIT_BYTES, type CommandMutationRisk, type CommandResultKind } from "./command-output.js";
+import { COMMAND_OUTPUT_ROOT, CommandOutputCaptureError, ensureCommandOutputRoot, CommandOutputStore, TOOL_OUTPUT_CONTEXT_LINE_LIMIT, TOOL_OUTPUT_PATTERN_LIMIT, TOOL_OUTPUT_READ_LIMIT_BYTES, type CommandMutationRisk, type CommandResultKind } from "./command-output.js";
 export * from "./stored-output.js";
 export * from "./modules.js";
 export * from "./write-claim.js";
 import { createModuleTool, type HarnessModuleRunContext, type HarnessModuleTool } from "./modules.js";
 
 export { BashCommandPlanner, bashOperationHasPreciseCommand, bashPermissionTarget, bashPermissionTargets, bashPlanUsesReadOnlySandbox, bashPlanUsesTrustedExecution, parseBashCommand, planBashCommand, resolveBashExecutable, type BashCommandPlan, type BashLeafOperation, type BashOperation, type BashPlanReason, type BashPlanRoute, type BashToolArguments } from "./bash-driver.js";
-export { COMMAND_OUTPUT_ROOT, CommandOutputStore, restrictToCurrentUser, COMMAND_OUTPUT_HEAD_BYTES, COMMAND_OUTPUT_LIMIT_BYTES, COMMAND_OUTPUT_PREVIEW_BYTES, COMMAND_OUTPUT_READABLE_LIMIT_BYTES, COMMAND_OUTPUT_TAIL_BYTES, RUN_OUTPUT_LIMIT_BYTES, summarizeTestOutput, TEST_OUTPUT_DIGEST_MIN_BYTES, TOOL_OUTPUT_CONTEXT_LINE_LIMIT, TOOL_OUTPUT_MANIFEST, TOOL_OUTPUT_PATTERN_LIMIT, TOOL_OUTPUT_READ_LIMIT_BYTES, type CommandMutationRisk, type CommandOutputReceipt, type CommandResultKind, type ToolOutputManifest, type ToolOutputManifestEntry, type ToolOutputRange, type ToolOutputSearch } from "./command-output.js";
+export { COMMAND_OUTPUT_ROOT, CommandOutputStore, ensureCommandOutputRoot, restrictToCurrentUser, COMMAND_OUTPUT_HEAD_BYTES, COMMAND_OUTPUT_LIMIT_BYTES, COMMAND_OUTPUT_PREVIEW_BYTES, COMMAND_OUTPUT_READABLE_LIMIT_BYTES, COMMAND_OUTPUT_TAIL_BYTES, RUN_OUTPUT_LIMIT_BYTES, summarizeTestOutput, TEST_OUTPUT_DIGEST_MIN_BYTES, TOOL_OUTPUT_CONTEXT_LINE_LIMIT, TOOL_OUTPUT_MANIFEST, TOOL_OUTPUT_PATTERN_LIMIT, TOOL_OUTPUT_READ_LIMIT_BYTES, type CommandMutationRisk, type CommandOutputReceipt, type CommandResultKind, type ToolOutputManifest, type ToolOutputManifestEntry, type ToolOutputRange, type ToolOutputSearch } from "./command-output.js";
 
 const MAX_INPUT_BYTES = 2 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 64 * 1024;
@@ -962,12 +962,16 @@ async function runBoundedProcess(
 		child.once("error", terminate);
 		child.once("exit", () => {
 			killedOnExit = true;
-			killTree(true);
+			// After a termination we requested, the Codex launcher and its CLI exit at once while the Linux
+			// sandbox helper is still stopping bubblewrap and removing its mount placeholders from the temp
+			// directory; force-killing the group now leaves them behind. The escalation timer still bounds
+			// the wait, and the group is force-killed once the helper releases stdio (on close).
+			if (!failure) killTree(true);
 		});
 		child.once("close", async (exitCode) => {
 			clearTimeout(timeout);
 			if (killTimer) clearTimeout(killTimer);
-			if (!killedOnExit) killTree(true);
+			if (!killedOnExit || failure) killTree(true);
 			signal?.removeEventListener("abort", onAbort);
 			await outputWrite;
 			let receipt;
@@ -1008,6 +1012,8 @@ export function runWorkspaceCommandTool(
 				const sensitivePaths = commandSandboxMode === "full-access" ? [] : await discoverSensitiveWorkspacePaths(resolved.root, signal);
 				if (sensitivePaths.length) throw new Error(`Sandboxed workspace commands are blocked while ${sensitivePaths.length} sensitive path${sensitivePaths.length === 1 ? " is" : "s are"} present; use structured tools or explicitly authorized full-access mode`);
 				await outputStore.prepare();
+				// The sandbox denies the shared output root; it must exist first (see ensureCommandOutputRoot).
+				if (commandSandboxMode !== "full-access") await ensureCommandOutputRoot();
 				invocation = createCodexSandboxInvocation(resolved.target, normalizeWorkspaceCommandArgv(argv), {
 					commandSandboxMode,
 					privatePaths,
