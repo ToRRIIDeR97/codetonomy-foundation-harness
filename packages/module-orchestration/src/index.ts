@@ -7,11 +7,11 @@ import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
-import { redactAuditString, type HarnessEventType, type RunResult, type VerificationResult } from "@agent-harness/contracts";
+import { redactAuditString, type HarnessEventType, type RunResult, type RunUsage, type VerificationResult } from "@agent-harness/contracts";
 import { runOrchestration, type OrchestrationNode, type OrchestrationResult } from "@agent-harness/orchestration";
 import { createHarness, resolveToolInterface, runtimeKnownSecrets, writeRuntimeFileAtomically, type HarnessModule, type HarnessModuleRunContext, type HarnessRunOptions } from "@agent-harness/runtime";
 import { RunTrace } from "@agent-harness/telemetry";
-import { truncateUtf8 } from "@agent-harness/tools";
+import { ModuleToolError, truncateUtf8 } from "@agent-harness/tools";
 
 export { MAXIMUM_CHILDREN_PER_RUN, MAXIMUM_DELEGATION_DEPTH, MAXIMUM_PARALLEL_WRITERS, normalizeWriteClaim, runOrchestration, writeClaimsOverlap, type OrchestrationNode, type OrchestrationResult, type WriteClaim } from "@agent-harness/orchestration";
 
@@ -42,7 +42,27 @@ export interface DelegateTasksResult {
 	output: string;
 	verificationPassed: boolean;
 	children: DelegateTasksChildResult[];
+	/** For the parent runtime, not the model: files the completed children changed. */
+	changedPaths?: string[];
+	/** For the parent runtime, not the model: every child run's usage, summed. */
+	additionalUsage?: RunUsage;
 }
+
+const sumUsage = (usages: readonly RunUsage[]): RunUsage => {
+	const total: RunUsage = { reported: true, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	for (const usage of usages) {
+		if (usage.reported === false) total.reported = false;
+		total.input += usage.input;
+		total.output += usage.output;
+		total.cacheRead += usage.cacheRead;
+		total.cacheWrite += usage.cacheWrite;
+		total.totalTokens += usage.totalTokens;
+		if (usage.reasoning !== undefined) total.reasoning = (total.reasoning ?? 0) + usage.reasoning;
+		if (usage.cost && total.cost) for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) total.cost[key] += usage.cost[key];
+		else if (usage.totalTokens > 0) delete total.cost;
+	}
+	return total;
+};
 
 const delegateTasksParameters = Type.Object({
 	nodes: Type.Array(Type.Object({
@@ -228,7 +248,9 @@ function delegateTasksTool(run: HarnessModuleRunContext | undefined): AgentTool<
 				...(signal ? { signal } : {}),
 			});
 			signal?.throwIfAborted();
-			if (!orchestration.verification.passed) throw new Error(delegationFailureMessage(orchestration));
+			const additionalUsage = sumUsage(orchestration.children.flatMap(({ run: child }) => child ? [child.usage] : []));
+			// Failed children still spent tokens on the parent's behalf; the error carries that usage to the parent.
+			if (!orchestration.verification.passed) throw new ModuleToolError(delegationFailureMessage(orchestration), additionalUsage);
 			const children = orchestration.children.slice(0, 3).map(({ id, status, run: child, error }) => ({
 				id,
 				status,
@@ -236,12 +258,20 @@ function delegateTasksTool(run: HarnessModuleRunContext | undefined): AgentTool<
 				...(child?.output ? { output: truncateUtf8(child.output, 4_000).text } : {}),
 				...(error ? { error: truncateUtf8(error, 1_000).text } : {}),
 			}));
-			const details: DelegateTasksResult = {
+			// Reported to the parent run: files the verified children changed count as its workspace change,
+			// and their usage is part of its usage (the shared spend budget already charged it).
+			const completed = orchestration.children.flatMap(({ status, run: child }) => status === "completed" && child ? [child] : []);
+			const visible = {
 				output: truncateUtf8(orchestration.output, 16_000).text,
 				verificationPassed: orchestration.verification.passed,
 				children,
 			};
-			const text = truncateUtf8(JSON.stringify(details, null, 2)).text;
+			const details: DelegateTasksResult = {
+				...visible,
+				changedPaths: [...new Set(completed.flatMap(({ changedPaths }) => changedPaths ?? []))],
+				additionalUsage,
+			};
+			const text = truncateUtf8(JSON.stringify(visible, null, 2)).text;
 			return { content: [{ type: "text", text }], details };
 		},
 	};

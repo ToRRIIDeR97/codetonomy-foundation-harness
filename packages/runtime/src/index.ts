@@ -541,6 +541,30 @@ const addUsage = (total: RunUsage, message: AgentMessage): void => {
 	}
 };
 
+/** Adds usage a module tool reported (child runs), on success or failure, to the run's usage; malformed reports are ignored. */
+const addReportedUsage = (total: RunUsage, value: unknown): void => {
+	const extra = value as Partial<RunUsage> | undefined;
+	const count = (item: unknown): item is number => typeof item === "number" && Number.isFinite(item) && item >= 0;
+	if (!extra || typeof extra !== "object" || ![extra.input, extra.output, extra.cacheRead, extra.cacheWrite, extra.totalTokens].every(count)) return;
+	if (extra.reported === false) total.reported = false;
+	total.input += extra.input!;
+	total.output += extra.output!;
+	total.cacheRead += extra.cacheRead!;
+	total.cacheWrite += extra.cacheWrite!;
+	total.totalTokens += extra.totalTokens!;
+	if (count(extra.reasoning)) total.reasoning = (total.reasoning ?? 0) + extra.reasoning;
+	if (total.cost) {
+		const cost = extra.cost;
+		if (cost && [cost.input, cost.output, cost.cacheRead, cost.cacheWrite, cost.total].every(count)) {
+			total.cost.input += cost.input;
+			total.cost.output += cost.output;
+			total.cost.cacheRead += cost.cacheRead;
+			total.cost.cacheWrite += cost.cacheWrite;
+			total.cost.total += cost.total;
+		} else if (extra.totalTokens! > 0) total.reported = false;
+	}
+};
+
 const outputDistribution = (message: AgentMessage): Record<string, unknown> => {
 	if (message.role !== "assistant") return {};
 	const reasoningTokens = message.usage.reasoning;
@@ -612,6 +636,8 @@ export function createHarness(): AgentHarness {
 			const runModules = options.modules ?? [];
 			const runModuleTools = listModuleTools(runModules);
 			const moduleToolIds = runModuleTools.map(({ definition }) => definition.name);
+			// Only approval-gated module tools may report workspace changes and usage made on the run's behalf.
+			const reportingModuleToolIds = new Set(runModuleTools.filter(({ access }) => access === "approval").map(({ definition }) => definition.name));
 			const workspaceInspectionTools = new Set([...WORKSPACE_INSPECTION_TOOLS, ...runModuleTools.filter(({ evidence }) => evidence === "inspection").map(({ definition }) => definition.name)]);
 			const workspaceEvidenceToolIds = runModuleTools.filter(({ evidence }) => evidence !== undefined).map(({ definition }) => definition.name);
 			// A resumed run adopts the saved spend projection when the caller does
@@ -1028,6 +1054,7 @@ export function createHarness(): AgentHarness {
 				}, writeClaim, {
 					moduleTools: runModuleTools,
 					moduleRun,
+					onModuleToolFailureUsage: (reported) => addReportedUsage(usage, reported),
 					commandSandboxMode: permissionMode === "full-access" ? "full-access" : "workspace",
 					bashCommandSandboxMode: permissionMode === "full-access"
 						? "full-access"
@@ -2112,6 +2139,19 @@ export function createHarness(): AgentHarness {
 							completedToolIds.add(canonicalToolId);
 							if (typeof resultDetails?.semanticOperationId === "string") completedToolIds.add(resultDetails.semanticOperationId);
 							successfulTurns.add(modelTurns);
+							if (reportingModuleToolIds.has(canonicalToolId)) {
+								// Verified work a module ran for this run (delegated child runs) counts as this run's change and spend.
+								for (const path of Array.isArray(resultDetails?.changedPaths) ? resultDetails.changedPaths : []) {
+									if (typeof path !== "string" || !path) continue;
+									const target = targetPath({ path })!;
+									if (!isWorkspaceTarget(target)) continue;
+									const revision = await revisionOf(target);
+									if (revision === "protected") continue;
+									fileEvidence.push({ target, action: revision === "absent" ? "delete" : "write", callId: event.toolCallId, current: revision !== "unknown", revision, modelTurn: modelTurns });
+									workspaceRevision++;
+								}
+								addReportedUsage(usage, resultDetails?.additionalUsage);
+							}
 							if (canonicalToolId === "run_workspace_command") {
 								for (const path of Array.isArray(resultDetails?.changedPaths) ? resultDetails.changedPaths : []) {
 									if (typeof path !== "string") continue;
@@ -2360,6 +2400,9 @@ export function createHarness(): AgentHarness {
 					{ artifactId: artifact.id, artifactType: artifact.type },
 					verifiedEvent?.eventId ?? runEventId,
 				);
+				const changedPaths = [...new Set(fileEvidence
+					.filter(({ action, current }) => current && (action === "write" || action === "delete"))
+					.map(({ target }) => relative(workspaceRoot, target).split(sep).join("/")))];
 				const result: RunResult = {
 					runId,
 					task: compiledTask,
@@ -2368,6 +2411,7 @@ export function createHarness(): AgentHarness {
 					artifacts: [artifact, ...toolArtifacts.values()],
 					verification,
 					usage,
+					...(changedPaths.length ? { changedPaths } : {}),
 					tracePath,
 					contextPacket,
 					reasoning,

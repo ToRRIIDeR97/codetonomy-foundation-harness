@@ -357,6 +357,8 @@ export interface RunResult {
 	modelContext?: RunModelContext;
 	model?: string;
 	durationMs?: number;
+	/** Workspace-relative paths the run (or verified work it delegated) wrote or deleted, still current at the end. */
+	changedPaths?: string[];
 	/** Recovery projection for session resume; never implies a successful run. */
 	recovery?: RunRecoveryState;
 }

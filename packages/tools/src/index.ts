@@ -1321,6 +1321,8 @@ export interface ResolveToolsOptions {
 	moduleTools?: readonly HarnessModuleTool[];
 	/** Passed to module tools so they can start child runs that inherit this run. */
 	moduleRun?: HarnessModuleRunContext;
+	/** Receives usage an approval-gated module tool reported with a thrown ModuleToolError. */
+	onModuleToolFailureUsage?: (usage: unknown) => void;
 }
 
 export function resolveTools(
@@ -1347,7 +1349,7 @@ export function resolveTools(
 		if (id === "edit_workspace") return editWorkspaceTool(workspaceRoot, observer, writeScope, privatePaths);
 		if (id === "run_workspace_command") return runWorkspaceCommandTool(workspaceRoot, { observer, commandSandboxMode: options.commandSandboxMode, outputStore: options.outputStore!, privatePaths });
 		const moduleTool = options.moduleTools?.find(({ definition }) => definition.name === id);
-		if (moduleTool) return createModuleTool(moduleTool, { workspaceRoot, privatePaths, ...(options.moduleRun ? { run: options.moduleRun } : {}) });
+		if (moduleTool) return createModuleTool(moduleTool, { workspaceRoot, privatePaths, ...(options.moduleRun ? { run: options.moduleRun } : {}) }, options.onModuleToolFailureUsage);
 		throw new Error(`Unknown tool: ${id}`);
 	});
 	return tools;

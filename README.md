@@ -99,6 +99,13 @@ only in the user message), and capture results after it. The core never imports 
 module. `createOrchestrationModule()` is the one shipped here; Codetonomy's
 memoryDB documents module is built the same way.
 
+An approval-gated module tool that does work on the run's behalf (like
+`delegate_tasks` starting child runs) reports it back to the core: `changedPaths`
+in its result details count as the run's own workspace changes, and
+`additionalUsage` is added to the run's usage. A failing tool throws
+`ModuleToolError(message, additionalUsage)` so its spend is still reported.
+`RunResult.changedPaths` lists the files a run changed.
+
 ## Tests
 
 `tests/` holds the Codetonomy tests that exercise only these packages; cases that
