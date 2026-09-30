@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import { tempDir } from "./support/temp.ts";
 
 const root = resolve(import.meta.dirname, "..");
@@ -24,7 +25,8 @@ const runWithTemp = (tmp: string, script: string): Promise<{ code: number | null
 	child.once("error", reject);
 	child.once("close", (code) => done({ code, output }));
 });
-const tools = JSON.stringify(join(root, "packages/tools/src/index.ts"));
+// A file URL: dynamic import() rejects bare Windows drive paths.
+const tools = JSON.stringify(pathToFileURL(join(root, "packages/tools/src/index.ts")).href);
 
 test("AC-1: a stale empty placeholder at the output root is replaced by a private directory; other files are refused", async (t) => {
 	const tmp = await tempDir(t, "sandbox-cleanup-root-");
@@ -33,7 +35,7 @@ test("AC-1: a stale empty placeholder at the output root is replaced by a privat
 		import { join } from "node:path";
 		import { tmpdir } from "node:os";
 		const path = join(tmpdir(), ".codetonomy-output");
-		writeFileSync(path, ""); chmodSync(path, 0o444);
+		writeFileSync(path, ""); if (process.platform !== "win32") chmodSync(path, 0o444);
 		const { ensureCommandOutputRoot } = await import(${tools});
 		await ensureCommandOutputRoot();
 		const info = lstatSync(path);

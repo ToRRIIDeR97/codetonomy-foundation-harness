@@ -51,6 +51,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: npm run build
       - run: node scripts/install-codex.mjs
+      - name: Expose managed ripgrep
+        shell: bash
+        run: |
+          node --input-type=module -e 'import { readdirSync, mkdirSync, copyFileSync, appendFileSync } from "node:fs"; import { join } from "node:path"; import { execFileSync } from "node:child_process"; const windows = process.platform === "win32"; const name = windows ? "rg.exe" : "rg"; const root = windows ? join(process.env.ChocolateyInstall, "lib/ripgrep") : undefined; const source = windows ? join(root, readdirSync(root, { recursive: true }).find(path => path.endsWith("rg.exe"))) : execFileSync("which", ["rg"], { encoding: "utf8" }).trim(); const destination = join(process.env.CODETONOMY_WORKER_ROOT, "tools"); mkdirSync(destination, { recursive: true }); copyFileSync(source, join(destination, name)); appendFileSync(process.env.GITHUB_PATH, destination + "\n");'
       - run: npm run test:only
         env:
           CODETONOMY_CODEX_BIN: ${{ runner.os == 'Windows' && format('{0}\\.codetonomy\\workers\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe', github.workspace) || format('{0}/.codetonomy/workers/codex/node_modules/.bin/codex', github.workspace) }}

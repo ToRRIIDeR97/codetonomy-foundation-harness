@@ -4,7 +4,7 @@
 // Ported from codetonomy Implementations/delegation-optimizations (PR 60).
 import assert from "node:assert/strict";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import type { HarnessEvent, RunResult } from "../packages/contracts/src/index.ts";
 import { createHarness } from "../packages/runtime/src/index.ts";
@@ -243,26 +243,28 @@ test("AC-6: a later verified delegation of the failed children resolves the fail
 
 test("AC-7: files a write only reads are inputs, negated verb lists are prohibitions, and writes outside writePaths are never required", async (t) => {
 	const root = "/ws";
+	// Targets are compared workspace-relative, so the expectations hold on Windows drive paths too.
+	const local = (target?: string) => target === undefined ? target : relative(resolve(root), target).split(sep).join("/");
 	const compiled = (objective: string, writePaths?: string[]) => {
 		const task = compileTask({ objective, workspaceRoot: root, ...(writePaths ? { writePaths } : {}) });
 		return {
-			writes: task.acceptanceCriteria.filter(({ action }) => action === "write" || action === "delete").map(({ target }) => target),
-			prohibited: (task.prohibitions ?? []).map(({ target }) => target),
+			writes: task.acceptanceCriteria.filter(({ action }) => action === "write" || action === "delete").map(({ target }) => local(target)),
+			prohibited: (task.prohibitions ?? []).map(({ target }) => local(target)),
 		};
 	};
 	const cases: Array<[string, string[], string[]?]> = [
-		["Read the file notes/alpha.md in the workspace. Then create a new file named alpha.txt in the workspace root containing exactly one sentence that summarizes the content of notes/alpha.md.", ["/ws/alpha.txt"]],
-		["Read notes/alpha.md and write a new file alpha.txt in the workspace root with a one-sentence summary of notes/alpha.md.", ["/ws/alpha.txt"]],
-		["Step 1: read the file notes/alpha.md. You must never write, edit, or overwrite notes/alpha.md. Step 2: create alpha.txt with a summary.", ["/ws/alpha.txt"], ["/ws/notes/alpha.md"]],
-		["Write a summary of notes/a.md to out.txt", ["/ws/out.txt"]],
-		["Create a copy of a.txt at b.txt", ["/ws/b.txt"]],
-		["Update src/config.ts to match the schema in docs/schema.md", ["/ws/src/config.ts"]],
-		["Implement src/module.ts from docs/spec.md", ["/ws/src/module.ts"]],
+		["Read the file notes/alpha.md in the workspace. Then create a new file named alpha.txt in the workspace root containing exactly one sentence that summarizes the content of notes/alpha.md.", ["alpha.txt"]],
+		["Read notes/alpha.md and write a new file alpha.txt in the workspace root with a one-sentence summary of notes/alpha.md.", ["alpha.txt"]],
+		["Step 1: read the file notes/alpha.md. You must never write, edit, or overwrite notes/alpha.md. Step 2: create alpha.txt with a summary.", ["alpha.txt"], ["notes/alpha.md"]],
+		["Write a summary of notes/a.md to out.txt", ["out.txt"]],
+		["Create a copy of a.txt at b.txt", ["b.txt"]],
+		["Update src/config.ts to match the schema in docs/schema.md", ["src/config.ts"]],
+		["Implement src/module.ts from docs/spec.md", ["src/module.ts"]],
 		// Unchanged behaviour.
-		["Fix the bug in src/app.ts", ["/ws/src/app.ts"]],
-		["Update the contents of src/a.ts", ["/ws/src/a.ts"]],
-		["Create src/a.ts and src/b.ts", ["/ws/src/a.ts", "/ws/src/b.ts"]],
-		["Do not modify README.md", [], ["/ws/README.md"]],
+		["Fix the bug in src/app.ts", ["src/app.ts"]],
+		["Update the contents of src/a.ts", ["src/a.ts"]],
+		["Create src/a.ts and src/b.ts", ["src/a.ts", "src/b.ts"]],
+		["Do not modify README.md", [], ["README.md"]],
 	];
 	for (const [objective, writes, prohibited = []] of cases) {
 		const result = compiled(objective);
@@ -270,8 +272,8 @@ test("AC-7: files a write only reads are inputs, negated verb lists are prohibit
 		assert.deepEqual(result.prohibited, prohibited, objective);
 	}
 	// A run limited to writePaths is never required to change anything else.
-	assert.deepEqual(compiled("Update a.txt and b.txt", ["a.txt"]), { writes: ["/ws/a.txt"], prohibited: ["/ws/b.txt"] });
-	assert.deepEqual(compiled("Update src/a.ts and src/b.ts", ["src"]).writes, ["/ws/src/a.ts", "/ws/src/b.ts"], "a directory claim covers its files");
+	assert.deepEqual(compiled("Update a.txt and b.txt", ["a.txt"]), { writes: ["a.txt"], prohibited: ["b.txt"] });
+	assert.deepEqual(compiled("Update src/a.ts and src/b.ts", ["src"]).writes, ["src/a.ts", "src/b.ts"], "a directory claim covers its files");
 
 	// End to end: the child objective that failed in the live check now verifies.
 	const workspace = await tempDir(t, "delegation-compile-");
