@@ -280,7 +280,7 @@ export class RunCheckpoint {
 					catch (error) { await this.#captureFailure(path, error); }
 				}
 			}
-			this.#file.files = this.#file.files.filter((snapshot, index) => index < this.#workspaceSnapshotStart || !snapshot.after || !sameState(snapshot, snapshot.after));
+			this.#file.files = this.#file.files.filter((snapshot, index) => index < this.#workspaceSnapshotStart || !snapshot.after || !sameContent(snapshot, snapshot.after));
 			this.#byPath.clear();
 			for (const snapshot of this.#file.files) this.#byPath.set(snapshot.path, snapshot);
 		} catch (error) {
