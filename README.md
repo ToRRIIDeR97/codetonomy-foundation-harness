@@ -43,13 +43,21 @@ npm run check
 npm test
 ```
 
-`run_workspace_command` executes commands inside the Codex CLI's native sandbox.
-Install the pinned version once, or point `CODETONOMY_CODEX_BIN` at a Codex binary
-you already have:
+`run_workspace_command` executes commands inside the Codetonomy sandbox. Its engine
+is a pinned, integrity-checked copy of the OpenAI Codex CLI, installed once into
+`~/.codetonomy/workers/sandbox` (under `$CODETONOMY_WORKER_ROOT` or
+`$CODETONOMY_HOME/workers` when set):
 
 ```bash
-node scripts/install-codex.mjs
+node scripts/install-sandbox.mjs
 ```
+
+The sandbox is separate from any Codex you have installed: a Codex on `PATH` or the
+desktop app is never used, and the engine runs with its own settings folder
+(`<worker root>/sandbox-home`) instead of your `~/.codex`. `CODETONOMY_SANDBOX_BIN`
+selects another engine binary explicitly. Sandboxed commands can't read workspace
+secret files (`.env*`, keys, credential files) or home-folder credential stores such
+as `~/.ssh`, `~/.aws` and CLI tokens.
 
 Search tools use `rg` when it is on `PATH`.
 
@@ -120,7 +128,7 @@ response, so they read its provider cache entry instead of writing their own.
 `tests/` holds the Codetonomy tests that exercise only these packages; cases that
 needed the CLI, evaluation store, sessions, memoryDB or OCR were left in
 Codetonomy. Tests that need a native tool skip themselves when it is missing:
-`rg` for the search and Bash tests, and the Codex sandbox for
+`rg` for the search and Bash tests, and the Codetonomy sandbox for
 `tests/sandbox-conformance.test.ts`.
 
 ## Licensing

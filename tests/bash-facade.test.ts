@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, link, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import test from "node:test";
 import { buildStableSystemPrompt, resolveCapabilities } from "../packages/capability-compiler/src/index.ts";
@@ -9,7 +9,7 @@ import type { ToolPermissionRequest } from "../packages/contracts/src/index.ts";
 import { createHarness, resolveToolInterface } from "../packages/runtime/src/index.ts";
 import { compileTask } from "../packages/task-compiler/src/index.ts";
 import { skipWithoutRipgrep } from "./support/environment.ts";
-import { BashCommandPlanner, bashPermissionTargets, bashPlanUsesReadOnlySandbox, bashTool, CommandOutputStore, createCodexSandboxInvocation, createNativeBashArgv, parseBashCommand, planBashCommand, searchWorkspaceTool } from "../packages/tools/src/index.ts";
+import { BashCommandPlanner, bashPermissionTargets, bashPlanUsesReadOnlySandbox, bashTool, CommandOutputStore, createSandboxInvocation, createNativeBashArgv, parseBashCommand, planBashCommand, searchWorkspaceTool, secretFileDenyEntries } from "../packages/tools/src/index.ts";
 import { tempDirs } from "./support/temp.ts";
 
 const temporaryDirectory = tempDirs();
@@ -243,23 +243,23 @@ test("read-only planning declines untrusted PATH resolution and ambiguous syntax
 
 test("bash facade falls back to native Bash for valid syntax outside the accelerator grammar", async () => {
 	const root = await temporaryDirectory("codetonomy-bash-native-");
-	const invocation = createCodexSandboxInvocation(root, createNativeBashArgv("pwd"), { commandSandboxMode: "read-only" });
+	const invocation = createSandboxInvocation(root, createNativeBashArgv("pwd"), { commandSandboxMode: "read-only" });
 	const state = JSON.parse(invocation[2]!) as { permissionProfile: { file_system: { entries: Array<{ access: string; path: { type: string; path?: string; value?: { kind?: string } } }> }; network: string } };
 	assert.ok(state.permissionProfile.file_system.entries.some(({ access, path }) => access === "read" && path.value?.kind === "project_roots"));
 	assert.equal(state.permissionProfile.network, "restricted");
 	assert.ok(invocation.includes("--sandbox-state-disable-network"));
 	const outputStore = new CommandOutputStore({ workspaceRoot: root, outputDirectory: join(root, "private-output"), indexPath: join(root, "runs", "run-id", "tool-output-manifest.json") });
-	const protectedInvocation = createCodexSandboxInvocation(root, createNativeBashArgv("pwd"), { commandSandboxMode: "workspace", privatePaths: outputStore.privatePaths() });
+	const protectedInvocation = createSandboxInvocation(root, createNativeBashArgv("pwd"), { commandSandboxMode: "workspace", privatePaths: outputStore.privatePaths() });
 	const protectedState = JSON.parse(protectedInvocation[2]!) as typeof state;
 	assert.ok(protectedState.permissionProfile.file_system.entries.some(({ access, path }) => access === "deny" && path.path === join(root, "runs", "run-id")));
 	const nested = join(root, "nested");
 	await mkdir(nested);
-	const nestedInvocation = createCodexSandboxInvocation(nested, createNativeBashArgv("pwd"), { commandSandboxMode: "read-only", sandboxWorkspaceRoot: root });
+	const nestedInvocation = createSandboxInvocation(nested, createNativeBashArgv("pwd"), { commandSandboxMode: "read-only", sandboxWorkspaceRoot: root });
 	const nestedState = JSON.parse(nestedInvocation[2]!) as typeof state;
 	assert.ok(nestedState.permissionProfile.file_system.entries.some(({ access, path }) => access === "deny" && path.path === join(root, ".git")));
 	await writeFile(join(root, "sandbox"), "console.log(JSON.stringify(process.argv.slice(2)));\n", "utf8");
 	const result = await testBashTool(root, {
-		codexBinary: process.execPath,
+		sandboxBinary: process.execPath,
 		commandSandboxMode: "read-only",
 		nativeOperationId: "run_workspace_command",
 		allowedCanonicalToolIds: ["run_workspace_command"],
@@ -275,7 +275,7 @@ test("bash facade falls back to native Bash for valid syntax outside the acceler
 test("direct Bash reads stay bounded", async () => {
  const root = await temporaryDirectory("codetonomy-bash-bounded-");
  await writeFile(join(root, "sandbox"), "process.stdout.write('x'.repeat(100000));\n");
- const result = await testBashTool(root, { codexBinary: process.execPath }).execute("bounded", { command: "cat large.txt" });
+ const result = await testBashTool(root, { sandboxBinary: process.execPath }).execute("bounded", { command: "cat large.txt" });
  assert.equal((result.details as { previewTruncated: boolean }).previewTruncated, true);
  assert.equal(typeof (result.details as { outputId?: string }).outputId, "string");
  assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /Output preview omitted/);
@@ -288,7 +288,7 @@ test("bash keeps rg literal and search_workspace is literal search only", async 
 	await writeFile(join(root, "packages", "item.ts"), "export const item = true;\n", "utf8");
 	await writeFile(join(root, "sandbox"), "console.log(JSON.stringify(process.argv.slice(2)));\n");
 	await writeFile(join(root, "packages", "sandbox"), "console.log(JSON.stringify(process.argv.slice(2)));\n");
-	const tool = testBashTool(root, { codexBinary: process.execPath });
+	const tool = testBashTool(root, { sandboxBinary: process.execPath });
 	const literal = await searchWorkspaceTool(root).execute("literal", { query: "alpha needle" });
 	assert.equal(literal.content[0]?.type === "text" ? literal.content[0].text : "", "README.md:1: alpha needle");
 	assert.equal((literal.details as { backend?: string }).backend, "literal");
@@ -325,7 +325,7 @@ test("Bash outcome classification separates search status from mutation risk", a
 	if (skipWithoutRipgrep(t)) return;
 	const root = await temporaryDirectory("codetonomy-bash-outcomes-");
 	await writeFile(join(root, "sandbox"), "const command = process.argv.at(-1); process.exit(command.includes('read-error') ? 2 : 1);\n");
-	const tool = testBashTool(root, { codexBinary: process.execPath });
+	const tool = testBashTool(root, { sandboxBinary: process.execPath });
 	const noMatch = await tool.execute("no-match", { command: "rg -F absent ." });
 	assert.equal(planBashCommand({ command: "rg -F absent ." }, root).readOnly, true, JSON.stringify(planBashCommand({ command: "rg -F absent ." }, root)));
 	assert.equal(noMatch.content[0]?.type === "text" ? noMatch.content[0].text : undefined, "");
@@ -425,11 +425,11 @@ test("Bash command prohibitions allow precise reads and fail closed through wrap
 	const root = await temporaryDirectory("codetonomy-bash-prohibition-");
 	await writeFile(join(root, "README.md"), "prohibition fixture\n");
 	await writeFile(join(root, "sandbox"), "require('node:fs').appendFileSync('executed.log', process.argv.at(-1) + '\\n'); process.stdout.write('fixture\\n');");
-	const previousCodex = process.env.CODETONOMY_CODEX_BIN;
-	process.env.CODETONOMY_CODEX_BIN = process.execPath;
+	const previousSandbox = process.env.CODETONOMY_SANDBOX_BIN;
+	process.env.CODETONOMY_SANDBOX_BIN = process.execPath;
 	t.after(async () => {
-		if (previousCodex === undefined) delete process.env.CODETONOMY_CODEX_BIN;
-		else process.env.CODETONOMY_CODEX_BIN = previousCodex;
+		if (previousSandbox === undefined) delete process.env.CODETONOMY_SANDBOX_BIN;
+		else process.env.CODETONOMY_SANDBOX_BIN = previousSandbox;
 	});
 	const run = async (command: string, objective = "Inspect README.md; do not run npm test") => {
 		let request = 0;
@@ -558,11 +558,11 @@ test("workspace-write ceilings retain semantic Bash reads without command access
 	const root = await temporaryDirectory("codetonomy-bash-write-ceiling-");
 	await writeFile(join(root, "README.md"), "ceiling fixture\n");
 	await writeFile(join(root, "sandbox"), "process.stdout.write('README.md:1:ceiling fixture\\n');");
-	const previousCodex = process.env.CODETONOMY_CODEX_BIN;
-	process.env.CODETONOMY_CODEX_BIN = process.execPath;
+	const previousSandbox = process.env.CODETONOMY_SANDBOX_BIN;
+	process.env.CODETONOMY_SANDBOX_BIN = process.execPath;
 	t.after(async () => {
-		if (previousCodex === undefined) delete process.env.CODETONOMY_CODEX_BIN;
-		else process.env.CODETONOMY_CODEX_BIN = previousCodex;
+		if (previousSandbox === undefined) delete process.env.CODETONOMY_SANDBOX_BIN;
+		else process.env.CODETONOMY_SANDBOX_BIN = previousSandbox;
 	});
 	let request = 0;
 	const calls = [
@@ -605,24 +605,31 @@ test("new native routes preserve original command and specialized ceilings", asy
  const root = await temporaryDirectory("codetonomy-bash-routes-");
  await writeFile(join(root, "sandbox"), "console.log(JSON.stringify(process.argv.slice(2)));");
  for (const [command, target] of [["rg alpha src", "search_workspace"], ["rg --files src", "list_workspace"], ["cat a", "inspect_workspace"]] as const) {
-  const result = await testBashTool(root, { codexBinary: process.execPath, commandSandboxMode: "read-only", nativeOperationId: "inspect_workspace", allowedCanonicalToolIds: [target] }).execute(command, { command });
+  const result = await testBashTool(root, { sandboxBinary: process.execPath, commandSandboxMode: "read-only", nativeOperationId: "inspect_workspace", allowedCanonicalToolIds: [target] }).execute(command, { command });
   const output = result.content[0]?.type === "text" ? result.content[0].text : "";
   assert.equal(JSON.parse(output).at(-1), command);
   assert.equal((result.details as { filesystem: string }).filesystem, "read-only");
  }
 	assert.equal(planBashCommand({ command: "rg --files --hidden" }, root).readOnly, false);
-	const unrestrictedRead = await testBashTool(root, { codexBinary: process.execPath, commandSandboxMode: "full-access", nativeOperationId: "inspect_workspace", allowedCanonicalToolIds: ["inspect_workspace"] }).execute("full-access-read", { command: "cat a" });
+	const unrestrictedRead = await testBashTool(root, { sandboxBinary: process.execPath, commandSandboxMode: "full-access", nativeOperationId: "inspect_workspace", allowedCanonicalToolIds: ["inspect_workspace"] }).execute("full-access-read", { command: "cat a" });
 	assert.equal((unrestrictedRead.details as Record<string, unknown>).operationId, "inspect_workspace");
 	assert.equal((unrestrictedRead.details as Record<string, unknown>).readOnly, false);
 	assert.equal((unrestrictedRead.details as Record<string, unknown>).filesystem, "full-access");
  for (const command of ["rg -F -e alpha -e beta src", "rg absent src | head -1 && cat a", "rg --sort path"]) {
-  const result = await testBashTool(root, { codexBinary: process.execPath, allowedCanonicalToolIds: ["run_workspace_command"] }).execute(command, { command });
+  const result = await testBashTool(root, { sandboxBinary: process.execPath, allowedCanonicalToolIds: ["run_workspace_command"] }).execute(command, { command });
   assert.equal(JSON.parse(result.content[0]?.type === "text" ? result.content[0].text : "").at(-1), command);
   await assert.rejects(testBashTool(root, { allowedCanonicalToolIds: ["search_workspace", "list_workspace", "inspect_workspace"] }).execute(command, { command }), /unavailable/);
  }
  await writeFile(join(root, ".env"), "DUMMY=synthetic");
+ // macOS and Linux hide secret files inside the sandbox by pattern; Windows still refuses the command.
+ const hidden = secretFileDenyEntries(await realpath(root)) !== undefined;
  for (const command of ["rg --files", "rg -e alpha -e beta ."]) {
-  await assert.rejects(testBashTool(root, { codexBinary: process.execPath }).execute(command, { command }), /sensitive path/);
+  const execution = testBashTool(root, { sandboxBinary: process.execPath }).execute(command, { command });
+  if (hidden) {
+   const result = await execution;
+   assert.equal(JSON.parse(result.content[0]?.type === "text" ? result.content[0].text : "").at(-1), command);
+  }
+  else await assert.rejects(execution, /sensitive path/);
  }
 });
 
@@ -632,6 +639,6 @@ test("native fallback rejects parsed workspace escapes and allows paths that rem
 	assert.doesNotThrow(() => parseBashCommand({ command: "cat ../../README.md", cwd: "packages/tools" }));
 	const root = await temporaryDirectory("codetonomy-bash-full-access-");
 	await writeFile(join(root, "sandbox"), "console.log(JSON.stringify(process.argv.slice(2)));");
-	const unrestricted = await testBashTool(root, { codexBinary: process.execPath, commandSandboxMode: "full-access" }).execute("full-access", { command: "cat ../outside.txt" });
+	const unrestricted = await testBashTool(root, { sandboxBinary: process.execPath, commandSandboxMode: "full-access" }).execute("full-access", { command: "cat ../outside.txt" });
 	assert.equal(JSON.parse(unrestricted.content[0]?.type === "text" ? unrestricted.content[0].text : "").at(-1), "cat ../outside.txt");
 });

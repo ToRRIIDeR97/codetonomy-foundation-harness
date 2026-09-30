@@ -242,7 +242,7 @@ test("process capture stops at quota without inventing mutation risk", async (t)
 	});
 	let details: Record<string, unknown> | undefined;
 	await assert.rejects(
-		runWorkspaceCommandTool(root, { codexBinary: process.execPath, commandSandboxMode: "read-only", outputStore: store }).execute("quota", { argv: ["ignored"], timeoutSeconds: 5 }),
+		runWorkspaceCommandTool(root, { sandboxBinary: process.execPath, commandSandboxMode: "read-only", outputStore: store }).execute("quota", { argv: ["ignored"], timeoutSeconds: 5 }),
 		(error: unknown) => {
 			details = (error as { details?: Record<string, unknown> }).details;
 			return details?.resultKind === "failure" && details.mutationRisk === "none" && details.outputComplete === false;
@@ -260,7 +260,7 @@ test("Bash executions share one run quota and one resolvable output namespace", 
 	await writeFile(join(root, "evidence.txt"), "fixture");
 	await writeFile(join(root, "sandbox"), "process.stdout.write('x'.repeat(20000));");
 	const store = new CommandOutputStore({ workspaceRoot: root, outputDirectory: join(root, "capture"), maxCommandBytes: 20_000, maxRunBytes: 30_000 });
-	const tool = bashTool(root, { codexBinary: process.execPath, commandSandboxMode: "read-only", outputStore: store });
+	const tool = bashTool(root, { sandboxBinary: process.execPath, commandSandboxMode: "read-only", outputStore: store });
 	const first = await tool.execute("first", { command: "cat evidence.txt" });
 	const outputId = String((first.details as Record<string, unknown>).outputId);
 	assert.equal((await store.read(outputId, 0, 4)).text, "xxxx");
@@ -279,7 +279,7 @@ process.stdout.write("stdout-one", () => setTimeout(() => {
 }, 10));
 `);
 	const store = new CommandOutputStore({ workspaceRoot: root, outputDirectory: join(root, "capture") });
-	const result = await runWorkspaceCommandTool(root, { codexBinary: process.execPath, commandSandboxMode: "read-only", outputStore: store }).execute("ordered", { argv: ["ignored"] });
+	const result = await runWorkspaceCommandTool(root, { sandboxBinary: process.execPath, commandSandboxMode: "read-only", outputStore: store }).execute("ordered", { argv: ["ignored"] });
 	assert.equal(result.content[0]?.type === "text" ? result.content[0].text : "", "stdout-onestderr-twostdout-three");
 });
 
@@ -289,7 +289,7 @@ test("command results preserve raw output, bounded receipts, and timeout evidenc
 	await writeFile(join(root, "sandbox"), "process.stdout.write('  raw output\\n');");
 	const receiptSecret = "receipt-secret-value";
 	const store = new CommandOutputStore({ workspaceRoot: root, outputDirectory: join(root, "capture"), knownSecrets: [receiptSecret] });
-	const tool = runWorkspaceCommandTool(root, { codexBinary: process.execPath, commandSandboxMode: "read-only", outputStore: store });
+	const tool = runWorkspaceCommandTool(root, { sandboxBinary: process.execPath, commandSandboxMode: "read-only", outputStore: store });
 	const result = await tool.execute("raw", { argv: ["ignored"], cwd: "." });
 	assert.equal(result.content[0]?.type === "text" ? result.content[0].text : undefined, "  raw output\n");
 	assert.match(result.content[1]?.type === "text" ? result.content[1].text : "", /^\[Command receipt:/);

@@ -131,8 +131,9 @@ test("command failure preserves mutation uncertainty and its primary error (fake
 	const shim = join(root, "sandbox");
 	await writeFile(shim, '#!/bin/sh\nprintf changed > count.txt\nwhile :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done\n');
 	await chmod(shim, 0o700);
-	const tool = runWorkspaceCommandTool(root, { codexBinary: shim, outputStore: new CommandOutputStore({ workspaceRoot: root, outputDirectory: join(root, "command-output") }), observer: { before: async () => {}, after: async () => {}, beforeWorkspace: async () => {}, afterWorkspace: async () => { throw new Error("observer failed"); } } });
-	await assert.rejects(tool.execute("command", { argv: ["ignored"], timeoutSeconds: 5 }), (error: unknown) => {
+	const tool = runWorkspaceCommandTool(root, { sandboxBinary: shim, outputStore: new CommandOutputStore({ workspaceRoot: root, outputDirectory: join(root, "command-output") }), observer: { before: async () => {}, after: async () => {}, beforeWorkspace: async () => {}, afterWorkspace: async () => { throw new Error("observer failed"); } } });
+	// The output cap, not the timeout, must stop the flood; a short timeout wins under heavy disk load.
+	await assert.rejects(tool.execute("command", { argv: ["ignored"], timeoutSeconds: 60 }), (error: unknown) => {
 		assert.match(String(error), /output exceeds/);
 		assert.equal((error as { details: { executionOutcome: string } }).details.executionOutcome, "effects-unknown");
 		return true;
@@ -227,8 +228,8 @@ test("uncertain commands cannot be replayed and Bash command evidence rejects ma
 	const shim = join(root, "sandbox");
 	await writeFile(shim, '#!/bin/sh\nprintf x >> count.txt\nexit 1\n');
 	await chmod(shim, 0o700);
-	const previous = process.env.CODETONOMY_CODEX_BIN;
-	process.env.CODETONOMY_CODEX_BIN = shim;
+	const previous = process.env.CODETONOMY_SANDBOX_BIN;
+	process.env.CODETONOMY_SANDBOX_BIN = shim;
 	try {
 		const failed = await run(root, "Run npm test", [
 			[{ name: "run_workspace_command", args: { argv: ["npm", "test"] } }],
@@ -246,8 +247,8 @@ test("uncertain commands cannot be replayed and Bash command evidence rejects ma
 			assert.equal(result.verification.passed, command === "npm test", command);
 		}
 	} finally {
-		if (previous === undefined) delete process.env.CODETONOMY_CODEX_BIN;
-		else process.env.CODETONOMY_CODEX_BIN = previous;
+		if (previous === undefined) delete process.env.CODETONOMY_SANDBOX_BIN;
+		else process.env.CODETONOMY_SANDBOX_BIN = previous;
 	}
 });
 
@@ -285,8 +286,8 @@ test("a failed required test can be retried only after a fresh read and correcti
 	const shim = join(root, "sandbox");
 	await writeFile(shim, '#!/bin/sh\nprintf x >> count.txt\nprintf diagnostic\n[ "$(cat source.txt)" = fixed ]\n');
 	await chmod(shim, 0o700);
-	const previous = process.env.CODETONOMY_CODEX_BIN;
-	process.env.CODETONOMY_CODEX_BIN = shim;
+	const previous = process.env.CODETONOMY_SANDBOX_BIN;
+	process.env.CODETONOMY_SANDBOX_BIN = shim;
 	try {
 		const { result, events, requestBodies } = await run(root, "Update source.txt. Run npm test", [
 			[{ name: "inspect_workspace", args: { path: "source.txt" } }],
@@ -308,8 +309,8 @@ test("a failed required test can be retried only after a fresh read and correcti
 		assert.equal(typeof failure.data.outputId, "string");
 		assert.ok(prompt.includes(String(failure.data.outputId)));
 	} finally {
-		if (previous === undefined) delete process.env.CODETONOMY_CODEX_BIN;
-		else process.env.CODETONOMY_CODEX_BIN = previous;
+		if (previous === undefined) delete process.env.CODETONOMY_SANDBOX_BIN;
+		else process.env.CODETONOMY_SANDBOX_BIN = previous;
 	}
 });
 
@@ -321,8 +322,8 @@ test("a settled optional command cannot replay but can yield to required validat
  const shim = join(root, "sandbox");
  await writeFile(shim, '#!/bin/sh\nif [ ! -e count.txt ]; then printf x > count.txt; exit 1; fi\nprintf x >> count.txt\n');
  await chmod(shim, 0o700);
- const previous = process.env.CODETONOMY_CODEX_BIN;
- process.env.CODETONOMY_CODEX_BIN = shim;
+ const previous = process.env.CODETONOMY_SANDBOX_BIN;
+ process.env.CODETONOMY_SANDBOX_BIN = shim;
  try {
   const { result, events } = await run(root, "Read BRIEF.md. Write README.md. Run npm test.", [
    [{ name: "run_workspace_command", args: { argv: ["node", "missing-demo.mjs"] } }],
@@ -338,8 +339,8 @@ test("a settled optional command cannot replay but can yield to required validat
   assert.equal(events.filter(e => e.type === "tool.failed" && String(e.data.message).includes("Previous mutation")).length, 3);
   assert.ok(events.some(e => e.type === "tool.failure.superseded" && String(e.data.reason).includes("not undone")));
  } finally {
-  if (previous === undefined) delete process.env.CODETONOMY_CODEX_BIN;
-  else process.env.CODETONOMY_CODEX_BIN = previous;
+  if (previous === undefined) delete process.env.CODETONOMY_SANDBOX_BIN;
+  else process.env.CODETONOMY_SANDBOX_BIN = previous;
  }
 });
 
@@ -372,8 +373,8 @@ test("an interrupted command never gets the settled-command continuation excepti
  const shim = join(root, "sandbox");
  await writeFile(shim, '#!/bin/sh\nprintf x >> count.txt\nwhile :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done\n');
  await chmod(shim, 0o700);
- const previous = process.env.CODETONOMY_CODEX_BIN;
- process.env.CODETONOMY_CODEX_BIN = shim;
+ const previous = process.env.CODETONOMY_SANDBOX_BIN;
+ process.env.CODETONOMY_SANDBOX_BIN = shim;
  try {
   const { result, events, requestBodies } = await run(root, "Update source.txt. Run npm test.", [
    [{ name: "run_workspace_command", args: { argv: ["node", "demo.mjs"], timeoutSeconds: 1 } }],
@@ -387,8 +388,8 @@ test("an interrupted command never gets the settled-command continuation excepti
   assert.equal(events.filter(e => e.type === "tool.failed" && String(e.data.message).includes("Previous mutation")).length, 2);
   assert.doesNotMatch(JSON.stringify(requestBodies[1]), /The command settled with a failure/);
  } finally {
-  if (previous === undefined) delete process.env.CODETONOMY_CODEX_BIN;
-  else process.env.CODETONOMY_CODEX_BIN = previous;
+  if (previous === undefined) delete process.env.CODETONOMY_SANDBOX_BIN;
+  else process.env.CODETONOMY_SANDBOX_BIN = previous;
  }
 });
 
@@ -399,8 +400,8 @@ test("recovery can create a confirmed absent target without pretending it was re
   const shim = join(root, "sandbox");
   await writeFile(shim, '#!/bin/sh\nprintf x >> count.txt\n[ -e source.txt ]\n');
   await chmod(shim, 0o700);
-  const previous = process.env.CODETONOMY_CODEX_BIN;
-  process.env.CODETONOMY_CODEX_BIN = shim;
+  const previous = process.env.CODETONOMY_SANDBOX_BIN;
+  process.env.CODETONOMY_SANDBOX_BIN = shim;
   try {
    const { result } = await run(root, "Create source.txt. Run npm test.", [
     [{ name: "run_workspace_command", args: { argv } }],
@@ -411,8 +412,8 @@ test("recovery can create a confirmed absent target without pretending it was re
    assert.equal(result.verification.passed, true, JSON.stringify(result.verification));
    assert.equal(await readFile(join(root, "count.txt"), "utf8"), "xx");
   } finally {
-   if (previous === undefined) delete process.env.CODETONOMY_CODEX_BIN;
-   else process.env.CODETONOMY_CODEX_BIN = previous;
+   if (previous === undefined) delete process.env.CODETONOMY_SANDBOX_BIN;
+   else process.env.CODETONOMY_SANDBOX_BIN = previous;
   }
  }
 });
@@ -442,8 +443,8 @@ test("external changes invalidate a trusted corrective-edit chain", async () => 
  const shim = join(root, "sandbox");
  await writeFile(shim, '#!/bin/sh\nprintf x >> count.txt\n[ "$(cat source.txt)" = ready ]\n');
  await chmod(shim, 0o700);
- const previous = process.env.CODETONOMY_CODEX_BIN;
- process.env.CODETONOMY_CODEX_BIN = shim;
+ const previous = process.env.CODETONOMY_SANDBOX_BIN;
+ process.env.CODETONOMY_SANDBOX_BIN = shim;
  const turns: Call[][] = [
   [{ name: "run_workspace_command", args: { argv: ["npm", "test"] } }],
   [{ name: "inspect_workspace", args: { path: "source.txt" } }],
@@ -463,8 +464,8 @@ test("external changes invalidate a trusted corrective-edit chain", async () => 
   assert.equal(await readFile(join(root, "count.txt"), "utf8"), "xx");
   assert.equal(events.filter(e => e.type === "tool.failed" && String(e.data.message).includes("Previous mutation")).length, 1);
  } finally {
-  if (previous === undefined) delete process.env.CODETONOMY_CODEX_BIN;
-  else process.env.CODETONOMY_CODEX_BIN = previous;
+  if (previous === undefined) delete process.env.CODETONOMY_SANDBOX_BIN;
+  else process.env.CODETONOMY_SANDBOX_BIN = previous;
  }
 });
 

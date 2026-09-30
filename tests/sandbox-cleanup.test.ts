@@ -58,7 +58,7 @@ test("AC-1: a stale empty placeholder at the output root is replaced by a privat
 	assert.match(refused.output, /refused: EEXIST/, "a non-empty file is never removed");
 });
 
-test("AC-2: on Linux, commands the harness times out leave no sandbox mount placeholders in the temp directory", { skip: process.platform !== "linux" || !process.env.CODETONOMY_CODEX_BIN ? "needs the Linux Codex sandbox" : false }, async (t) => {
+test("AC-2: on Linux, commands the harness times out leave no sandbox mount placeholders in the temp directory", { skip: process.platform !== "linux" || !process.env.CODETONOMY_SANDBOX_BIN ? "needs the Linux Codetonomy sandbox" : false }, async (t) => {
 	const tmp = await tempDir(t, "sandbox-cleanup-kill-");
 	const run = await runWithTemp(tmp, `
 		import { mkdtempSync } from "node:fs";
