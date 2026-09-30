@@ -4,7 +4,7 @@
 
 import { extname } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { RunResult } from "@agent-harness/contracts";
+import type { RunResult, RunUsage } from "@agent-harness/contracts";
 
 export interface HarnessModuleToolDefinition {
 	name: string;
@@ -124,10 +124,34 @@ export const moduleToolOffered = (tool: HarnessModuleTool, inputPaths: readonly 
 	return inputPaths.some((path) => extensions.has(extname(path).toLowerCase()));
 };
 
-export function createModuleTool(tool: HarnessModuleTool, context: HarnessModuleToolContext): AgentTool {
+/**
+ * Thrown by an approval-gated module tool that fails after spending model usage on the run's behalf
+ * (for example delegated child runs that did not verify). The runtime adds the usage, then the model
+ * sees the error as usual. A successful result reports the same through `details.additionalUsage`.
+ */
+export class ModuleToolError extends Error {
+	constructor(message: string, readonly additionalUsage?: RunUsage) {
+		super(message);
+		this.name = "ModuleToolError";
+	}
+}
+
+export function createModuleTool(tool: HarnessModuleTool, context: HarnessModuleToolContext, onFailureUsage?: (usage: unknown) => void): AgentTool {
 	const created = tool.create(context);
 	if (!created || created.name !== tool.definition.name || typeof created.execute !== "function") {
 		throw new Error(`Invalid module configuration: ${tool.definition.name} created a tool with a different name`);
 	}
+	if (tool.access !== "approval" || !onFailureUsage) return created;
+	const execute = created.execute.bind(created);
+	created.execute = async (...args) => {
+		try {
+			return await execute(...args);
+		} catch (error) {
+			// Duck-typed so a module built against another copy of this package is still counted.
+			const usage = (error as { additionalUsage?: unknown } | null)?.additionalUsage;
+			if (usage !== undefined) onFailureUsage(usage);
+			throw error;
+		}
+	};
 	return created;
 }
