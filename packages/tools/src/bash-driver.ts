@@ -1,5 +1,5 @@
 import { accessSync, constants, existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 const CHAIN_OPERATORS = new Set([";", "&&", "||"] as const);
@@ -661,13 +661,22 @@ const readOperandsAreSafe = (operation: BashOperation, semanticArgv: readonly st
 	return !semanticArgv?.includes("--hidden");
 };
 
+/** Worker roots that may hold Codetonomy's managed installs, most specific first. */
+export const workerRoots = (): string[] => [
+	process.env.CODETONOMY_WORKER_ROOT,
+	process.env.CODETONOMY_HOME ? join(process.env.CODETONOMY_HOME, "workers") : undefined,
+	join(homedir(), ".codetonomy", "workers"),
+].filter((value): value is string => Boolean(value));
+
+// System directories and Codetonomy's own worker roots, which sandboxed commands cannot write. Other
+// applications' bundles (such as the Codex or ChatGPT desktop apps and their bundled tools) are not trusted.
 const trustedReadRoots = (): string[] => [...new Set([
 	"/bin",
 	"/usr/bin",
 	"/usr/sbin",
-	...(process.platform === "darwin" ? ["/System", "/Applications/ChatGPT.app/Contents/Resources", "/Applications/Codex.app/Contents/Resources"] : []),
+	...(process.platform === "darwin" ? ["/System"] : []),
 	...(process.platform === "win32" ? [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.SystemRoot] : []),
-	process.env.CODETONOMY_WORKER_ROOT,
+	...workerRoots(),
 ].filter((path): path is string => typeof path === "string" && isAbsolute(path)).flatMap((path) => {
 	try { return [realpathSync.native(path)]; }
 	catch { return []; }

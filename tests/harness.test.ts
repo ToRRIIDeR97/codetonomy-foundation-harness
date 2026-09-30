@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { link, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { isSensitiveWorkspacePath } from "../packages/contracts/src/index.ts";
@@ -13,7 +13,7 @@ import { compileTask } from "../packages/task-compiler/src/index.ts";
 import { skipWithoutRipgrep } from "./support/environment.ts";
 import {
 	editWorkspaceTool,
-	createCodexSandboxInvocation,
+	createSandboxInvocation,
 	CommandOutputStore,
 	filterSandboxEnvironment,
 	inspectWorkspaceTool,
@@ -21,6 +21,7 @@ import {
 	toolCacheDefinitions,
 	searchWorkspaceTool,
 	runWorkspaceCommandTool,
+	secretFileDenyEntries,
 	READ_ONLY_TOOL_IDS,
 	writeWorkspaceTool,
 } from "../packages/tools/src/index.ts";
@@ -517,7 +518,10 @@ test("workspace discovery lists files and searches code without following ignore
 	await assert.rejects(() => inspectWorkspaceTool(root).execute("protected", { path: ".codetonomy/credentials.env" }), /protected/);
 	await assert.rejects(() => inspectWorkspaceTool(root).execute("sensitive", { path: ".env" }), /Sensitive workspace paths/);
 	await assert.rejects(() => writeWorkspaceTool(root).execute("sensitive-write", { path: ".env.local", content: "SECRET=bad" }), /Sensitive workspace paths/);
-	await assert.rejects(() => runWorkspaceCommandTool(root, { codexBinary: process.execPath, outputStore: commandOutputStore(root) }).execute("sensitive-command", { argv: ["ignored"] }), /commands are blocked.*sensitive path/);
+	// macOS and Linux hide secret files inside the sandbox by pattern; Windows still refuses the command.
+	const sensitiveCommand = () => runWorkspaceCommandTool(root, { sandboxBinary: process.execPath, outputStore: commandOutputStore(root) }).execute("sensitive-command", { argv: ["ignored"] });
+	if (secretFileDenyEntries(await realpath(root))) await sensitiveCommand();
+	else await assert.rejects(sensitiveCommand, /commands are blocked.*sensitive path/);
 
 	const searched = await searchWorkspaceTool(root).execute("search", { query: "polar bear" });
 	const searchText = searched.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("");
@@ -553,9 +557,9 @@ test("workspace writes are atomic, exact, and confined to the workspace", async 
 	);
 });
 
-test("workspace commands use argv-only Codex sandboxing and propagate cancellation", async () => {
+test("workspace commands use argv-only Codetonomy sandboxing and propagate cancellation", async () => {
 	const root = await temporaryDirectory("codetonomy-command-");
-	const invocation = createCodexSandboxInvocation(root, ["npm", "test"]);
+	const invocation = createSandboxInvocation(root, ["npm", "test"]);
 	assert.deepEqual(invocation.slice(-3), ["--", "npm", "test"]);
 	const state = JSON.parse(invocation[2]!) as {
 		permissionProfile: { network: string; file_system: { entries: Array<{ access: string; path: { type: string; value?: { kind?: string } } }> } };
@@ -569,7 +573,7 @@ test("workspace commands use argv-only Codex sandboxing and propagate cancellati
 	const shim = join(root, "sandbox");
 	await writeFile(shim, "setInterval(() => {}, 1000);\n", "utf8");
 	const abort = new AbortController();
-	const execution = runWorkspaceCommandTool(root, { codexBinary: process.execPath, outputStore: commandOutputStore(root) }).execute("run", { argv: ["npm", "test"], timeoutSeconds: 30 }, abort.signal);
+	const execution = runWorkspaceCommandTool(root, { sandboxBinary: process.execPath, outputStore: commandOutputStore(root) }).execute("run", { argv: ["npm", "test"], timeoutSeconds: 30 }, abort.signal);
 	setTimeout(() => abort.abort(), 20);
 	await assert.rejects(() => execution, /aborted/);
 });
@@ -581,7 +585,7 @@ test("workspace command checkpoints restore edited and newly created files", asy
 	await writeFile(shim, "const fs = require('node:fs'); fs.writeFileSync('existing.txt', 'after'); fs.writeFileSync('created.txt', 'new');\n", "utf8");
 	const checkpointPath = join(root, ".harness", "command.json");
 	const checkpoint = new RunCheckpoint(root, "command-run", checkpointPath);
-	const result = await runWorkspaceCommandTool(root, { codexBinary: process.execPath, observer: checkpoint, outputStore: commandOutputStore(root) }).execute("run", { argv: ["ignored"] });
+	const result = await runWorkspaceCommandTool(root, { sandboxBinary: process.execPath, observer: checkpoint, outputStore: commandOutputStore(root) }).execute("run", { argv: ["ignored"] });
 	assert.equal((result.details as { rewindCoverage?: string }).rewindCoverage, "incomplete");
 	assert.deepEqual((await previewCheckpoint(checkpointPath, root)).files, ["existing.txt", "created.txt"]);
 	await rewindCheckpoint(checkpointPath, root);

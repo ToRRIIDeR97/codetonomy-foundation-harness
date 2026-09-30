@@ -27,10 +27,10 @@ Pi is licensed under the MIT License, Copyright (c) 2025 Mario Zechner:
 The query-centered snippet logic adapts Reasonix's `MakeSnippet`, licensed
 under the same MIT terms above, Copyright (c) 2026 Reasonix Contributors.
 
-OpenAI Codex (Apache-2.0) is not distributed in this project. `scripts/install-codex.mjs`
+OpenAI Codex (Apache-2.0) is not distributed in this project. `scripts/install-sandbox.mjs`
 installs the pinned `@openai/codex` npm package, recorded in
-`deployment/codex-version.env`, into a separate worker directory and checks its
-integrity; it is used only as the native command sandbox.
+`deployment/sandbox-version.env`, into a separate worker directory and checks its
+integrity; it is used only as the engine of the Codetonomy command sandbox.
 
 The pnpm patch in `patches/@earendil-works__pi-ai@0.84.1.patch` modifies Pi
 0.84.1 provider finalization, argument validation, and provider retry telemetry.

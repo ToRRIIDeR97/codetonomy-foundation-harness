@@ -1,15 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { accessSync, constants, existsSync, readdirSync, realpathSync, statSync, type Stats } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, readdirSync, realpathSync, statSync, type Stats } from "node:fs";
 import { lstat, mkdir, open, opendir, realpath, rename, unlink } from "node:fs/promises";
-import { basename, delimiter, dirname, isAbsolute, join, matchesGlob, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, matchesGlob, relative, resolve, sep } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { isSensitiveWorkspacePath, redactAuditString } from "@agent-harness/contracts";
-import { bashInstallationRoot as bashInstallationRootOf, BashCommandPlanner, bashPermissionTarget, bashPermissionTargets, bashPlanUsesReadOnlySandbox, bashPlanUsesTrustedExecution, planBashCommand, resolveBashExecutable, sandboxPlatformDefaultsOverlap, type BashCommandPlan, type BashLeafOperation, type BashOperation, type BashToolArguments } from "./bash-driver.js";
+import { bashInstallationRoot as bashInstallationRootOf, workerRoots, BashCommandPlanner, bashPermissionTarget, bashPermissionTargets, bashPlanUsesReadOnlySandbox, bashPlanUsesTrustedExecution, planBashCommand, resolveBashExecutable, sandboxPlatformDefaultsOverlap, type BashCommandPlan, type BashLeafOperation, type BashOperation, type BashToolArguments } from "./bash-driver.js";
 import { COMMAND_OUTPUT_ROOT, CommandOutputCaptureError, ensureCommandOutputRoot, CommandOutputStore, TOOL_OUTPUT_CONTEXT_LINE_LIMIT, TOOL_OUTPUT_PATTERN_LIMIT, TOOL_OUTPUT_READ_LIMIT_BYTES, type CommandMutationRisk, type CommandResultKind } from "./command-output.js";
 export * from "./stored-output.js";
 export * from "./modules.js";
@@ -166,7 +166,7 @@ export const toolCacheDefinitions = {
 	run_workspace_command: {
 		name: "run_workspace_command",
 		version: "1.1.0",
-		description: "Run an argv command from a workspace cwd with bounded output and filtered secrets. In ask/auto mode, Codex confines writes and disables network; full-access mode disables filesystem and network sandboxing. The active permission mode controls approval.",
+		description: "Run an argv command from a workspace cwd with bounded output and filtered secrets. In ask/auto mode, the Codetonomy sandbox confines writes and disables network; full-access mode disables filesystem and network sandboxing. The active permission mode controls approval.",
 		parameters: runWorkspaceCommandParameters,
 	},
 	bash: {
@@ -612,7 +612,7 @@ export function editWorkspaceTool(workspaceRoot: string, observer?: WorkspaceMut
 export type CommandSandboxMode = "read-only" | "workspace" | "full-access";
 
 export interface SandboxCommandOptions {
-	codexBinary?: string;
+	sandboxBinary?: string;
 	observer?: WorkspaceMutationObserver;
 	commandSandboxMode?: CommandSandboxMode;
 	allowArgumentLineBreaks?: boolean;
@@ -637,9 +637,10 @@ const resolveHostExecutable = (program: string): string | undefined => {
 	return undefined;
 };
 
-// Resolve the pinned npm package's native entry point before restricting PATH.
-// Its JavaScript launcher needs Node on PATH, which semantic commands restrict.
-const nativeCodexEntry = (program: string): string => {
+// The Codetonomy sandbox runs commands through its engine, a pinned copy of the OpenAI Codex CLI
+// (npm `@openai/codex`, invoked as `codex sandbox`). Resolve the package's native entry point before
+// restricting PATH: its JavaScript launcher needs Node on PATH, which semantic commands restrict.
+const nativeSandboxEntry = (program: string): string => {
 	try {
 		const launcher = realpathSync.native(program);
 		if (basename(launcher) !== "codex.js") return program;
@@ -651,42 +652,125 @@ const nativeCodexEntry = (program: string): string => {
 	return program;
 };
 
-export const resolveCodexBinary = (explicit?: string): string => {
-	if (explicit) return nativeCodexEntry(resolveHostExecutable(explicit) ?? explicit);
-	if (process.env.CODETONOMY_CODEX_BIN) return nativeCodexEntry(resolveHostExecutable(process.env.CODETONOMY_CODEX_BIN) ?? process.env.CODETONOMY_CODEX_BIN);
-	const workerRoots = [
-		process.env.CODETONOMY_WORKER_ROOT,
-		process.env.CODETONOMY_HOME ? join(process.env.CODETONOMY_HOME, "workers") : undefined,
-		join(homedir(), ".codetonomy", "workers"),
-	].filter((value): value is string => Boolean(value));
+export const SANDBOX_INSTALL_HINT = "The Codetonomy sandbox is not installed; run: node scripts/install-sandbox.mjs";
+
+/**
+ * The sandbox engine binary: an explicit path, CODETONOMY_SANDBOX_BIN, or the pinned install that
+ * `scripts/install-sandbox.mjs` puts under the worker root. The user's own Codex (on PATH or the
+ * desktop app) is never used: it can be another version with other behaviour. Without an
+ * install this returns the expected managed path, which does not exist.
+ */
+export const resolveSandboxBinary = (explicit?: string): string => {
+	if (explicit) return nativeSandboxEntry(resolveHostExecutable(explicit) ?? explicit);
+	if (process.env.CODETONOMY_SANDBOX_BIN) return nativeSandboxEntry(resolveHostExecutable(process.env.CODETONOMY_SANDBOX_BIN) ?? process.env.CODETONOMY_SANDBOX_BIN);
 	const windowsTarget = process.arch === "arm64" ? ["codex-win32-arm64", "aarch64-pc-windows-msvc"] : ["codex-win32-x64", "x86_64-pc-windows-msvc"];
-	const workerCandidates = workerRoots.flatMap((root) => process.platform === "win32"
-		? [join(root, "codex", "node_modules", `@openai/${windowsTarget[0]}`, "vendor", windowsTarget[1]!, "bin", "codex.exe")]
-		: [join(root, "codex", "node_modules", ".bin", "codex")]);
-	let desktopCandidates: string[] = [];
-	if (process.platform === "win32" && process.env.LOCALAPPDATA) {
-		const desktopBin = join(process.env.LOCALAPPDATA, "OpenAI", "Codex", "bin");
-		try {
-			desktopCandidates = readdirSync(desktopBin, { withFileTypes: true })
-				.filter((entry) => entry.isDirectory())
-				.map((entry) => join(desktopBin, entry.name, "codex.exe"))
-				.filter(existsSync)
-				.sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs);
-		} catch {}
-	}
-	const candidates = [...workerCandidates, ...desktopCandidates];
-	return nativeCodexEntry(candidates.find(existsSync) ?? resolveHostExecutable("codex") ?? "codex");
+	const candidates = workerRoots().map((root) => process.platform === "win32"
+		? join(root, "sandbox", "node_modules", `@openai/${windowsTarget[0]}`, "vendor", windowsTarget[1]!, "bin", "codex.exe")
+		: join(root, "sandbox", "node_modules", ".bin", "codex"));
+	return nativeSandboxEntry(candidates.find(existsSync) ?? candidates[0]!);
 };
 
+/**
+ * The engine's CODEX_HOME: a folder Codetonomy owns under the worker root, so the user's own
+ * ~/.codex (settings, plugins, MCP servers, hooks, login) never shapes a sandboxed command. It sits
+ * inside the configuration root that sandboxed commands cannot read or write.
+ */
+export const sandboxHome = (): string => join(workerRoots()[0]!, "sandbox-home");
+
+/** True when the sandbox engine resolves to an existing binary. */
+export const sandboxInstalled = (): boolean => existsSync(resolveSandboxBinary());
+
 const sandboxRuntimeReadPaths = (): string[] => {
-	const codexBinary = resolveCodexBinary();
-	const codexDirectory = isAbsolute(codexBinary) ? dirname(codexBinary) : undefined;
-	const codexInstallation = codexDirectory && basename(codexDirectory) === ".bin" ? dirname(codexDirectory) : codexDirectory;
+	const sandboxBinary = resolveSandboxBinary();
+	const sandboxDirectory = isAbsolute(sandboxBinary) ? dirname(sandboxBinary) : undefined;
+	const sandboxInstallation = sandboxDirectory && basename(sandboxDirectory) === ".bin" ? dirname(sandboxDirectory) : sandboxDirectory;
 	return [...new Set([
 		dirname(process.execPath),
-		codexInstallation,
+		sandboxInstallation,
 		...(process.platform === "darwin" ? ["/System/Library/OpenSSL"] : []),
 	].filter((path): path is string => Boolean(path)))];
+};
+
+// Secret files are hidden inside the sandbox by pattern instead of refusing every command after a
+// workspace scan. The engine compiles deny globs into the Seatbelt profile on macOS and expands them with
+// ripgrep at launch on Linux. The patterns mirror isSensitiveWorkspacePath, case-insensitively.
+const caseInsensitiveGlob = (glob: string): string => glob.replace(/[a-z]/gi, (letter) => `[${letter.toLowerCase()}${letter.toUpperCase()}]`);
+const SECRET_FILE_GLOBS = [
+	".ssh", ".ssh/**", ".aws", ".aws/**", ".gnupg", ".gnupg/**",
+	".kube/config",
+	".env", ".env.*",
+	".npmrc", ".pypirc", ".netrc",
+	"{credential,credentials,secret,secrets}.{json,yml,yaml,toml,ini,conf,txt}",
+	// Globs cannot express the predicate's "id_ without a dot", so only standard private key names.
+	"id_{rsa,dsa,ecdsa,ed25519,ecdsa_sk,ed25519_sk}",
+	"*.{key,pem,p12,pfx,keystore}",
+].map((glob) => `**/${caseInsensitiveGlob(glob)}`);
+const GLOB_SYNTAX = /[*?[\]{}\\]/;
+
+/**
+ * Deny entries that hide workspace secret files from sandboxed commands, or undefined where the
+ * sandbox cannot take them and the caller must scan instead: Windows (untested glob path handling)
+ * and workspace roots whose own path contains glob syntax.
+ */
+export const secretFileDenyEntries = (workspaceRoot: string, platform: NodeJS.Platform = process.platform): Array<{ path: { type: "glob_pattern"; pattern: string }; access: "deny" }> | undefined =>
+	platform === "win32" || GLOB_SYNTAX.test(workspaceRoot)
+		? undefined
+		: SECRET_FILE_GLOBS.map((glob) => ({ path: { type: "glob_pattern", pattern: `${workspaceRoot}/${glob}` }, access: "deny" }));
+
+// Reads are broad so toolchains work; these credential stores stay unreadable.
+const HOME_SECRET_PATHS = [
+	".ssh", ".aws", ".gnupg", ".kube/config", ".docker/config.json", ".config/gh/hosts.yml", ".config/gcloud", ".azure",
+	"Library/Keychains", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".config/git/credentials",
+];
+
+export const homeSecretPaths = (): string[] => {
+	const home = homedir();
+	const codexHome = process.env.CODEX_HOME?.trim();
+	return [
+		...HOME_SECRET_PATHS.map((path) => join(home, path)),
+		join(codexHome && isAbsolute(codexHome) ? codexHome : join(home, ".codex"), "auth.json"),
+	];
+};
+
+type SandboxPathEntry = { path: { type: string; path?: string; pattern?: string; value?: unknown }; access: string; missing_path_behavior?: string };
+
+const pathExists = (path: string): boolean => {
+	try { lstatSync(path); return true; }
+	catch { return false; }
+};
+
+// Engine 0.159 adds ~3 ms to every launch per path rule, while one deny glob is a single Seatbelt regex.
+// macOS therefore denies the home credential stores with one glob; Linux would scan the home folder
+// to expand it, so other platforms keep one rule per path. A rule for a missing path still blocks
+// creating it, so only missing paths outside the workspace (where commands cannot write) are left
+// out. A deny containing the workspace would block the command's own files and is skipped.
+const homeSecretDenyEntries = (workspaceRoot: string): SandboxPathEntry[] => {
+	const home = homedir();
+	const candidates = homeSecretPaths().filter((path) => !pathWithin(path, workspaceRoot));
+	const globbed = process.platform === "darwin" && !GLOB_SYNTAX.test(home)
+		? candidates.filter((path) => path !== home && pathWithin(home, path) && !GLOB_SYNTAX.test(relative(home, path)))
+		: [];
+	// Glob alternatives are exact, so each store also denies its contents.
+	const alternatives = globbed.flatMap((path) => {
+		const name = relative(home, path).split(sep).join("/");
+		return [name, `${name}/**`];
+	});
+	return [
+		...(alternatives.length ? [{ path: { type: "glob_pattern", pattern: `${home}/{${alternatives.join(",")}}` }, access: "deny" }] : []),
+		...candidates.filter((path) => !globbed.includes(path) && (pathExists(path) || pathWithin(workspaceRoot, path))).map((path) => ({ path: { type: "path", path }, access: "deny", missing_path_behavior: "skip" })),
+	];
+};
+
+// A read entry inside another read entry adds nothing, unless a write or deny entry also contains it:
+// then it narrows that broader grant and must stay. `writableRoots` covers the special temp roots.
+const redundantRead = (entry: SandboxPathEntry, entries: readonly SandboxPathEntry[], writableRoots: readonly string[]): boolean => {
+	const path = entry.path.path;
+	if (entry.access !== "read" || entry.path.type !== "path" || !path) return false;
+	const index = entries.indexOf(entry);
+	const covered = entries.some((other, otherIndex) => otherIndex !== index && other.access === "read" && other.path.type === "path" && !!other.path.path
+		&& pathWithin(other.path.path, path) && (other.path.path !== path || otherIndex < index));
+	return covered && !writableRoots.some((root) => pathWithin(root, path))
+		&& !entries.some((other) => other.access !== "read" && other.path.type === "path" && !!other.path.path && pathWithin(other.path.path, path));
 };
 
 const SANDBOX_ENVIRONMENT = /^(?:PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|TEMP|TMP|TERM|COLORTERM|NO_COLOR|FORCE_COLOR|LANG|LC_.+|CODEX_HOME|RUST_LOG|RUST_BACKTRACE|SystemRoot|WINDIR|PATHEXT|ComSpec)$/;
@@ -708,7 +792,7 @@ export const normalizeWorkspaceCommandArgv = (argv: string[]): string[] => {
 	return existsSync(npmCli) ? [process.execPath, npmCli, ...argv.slice(1)] : argv;
 };
 
-export function createCodexSandboxInvocation(
+export function createSandboxInvocation(
 	cwd: string,
 	argv: string[],
 	{ commandSandboxMode = "workspace", privatePaths = [], sandboxWorkspaceRoot }: Pick<SandboxCommandOptions, "commandSandboxMode" | "privatePaths" | "sandboxWorkspaceRoot"> = {},
@@ -743,7 +827,7 @@ export function createCodexSandboxInvocation(
 		access: commandSandboxMode === "read-only" ? "deny" : "read",
 		missing_path_behavior: "skip",
 	}));
-	// Deny the configuration (credentials) even at its default location: on Windows, Codex's full-read
+	// Deny the configuration (credentials) even at its default location: on Windows, the engine's full-read
 	// setup grants the shared sandbox accounts read access to every top-level profile folder.
 	const configurationRoot = process.env.CODETONOMY_HOME?.trim() || join(homedir(), ".codetonomy");
 	if ([COMMAND_OUTPUT_ROOT, ...privatePaths, ...(configurationRoot && isAbsolute(configurationRoot) ? [configurationRoot] : [])].some(sandboxPlatformDefaultsOverlap)) {
@@ -759,8 +843,11 @@ export function createCodexSandboxInvocation(
 		access: "deny",
 		missing_path_behavior: "skip",
 	}));
+	const homeSecretEntries = homeSecretDenyEntries(workspaceRoot);
+	const homeSecretPathEntries = homeSecretEntries.filter((entry): entry is SandboxPathEntry & { path: { path: string } } => entry.path.type === "path" && !!entry.path.path)
+		.map((entry) => ({ path: { type: "path", path: entry.path.path }, access: "deny", missing_path_behavior: "skip" }));
 	// A denied parent already covers its descendants; nested deny mounts fail in bubblewrap.
-	const denyEntries = [...privateConfigurationPath, ...protectedPaths.filter(({ access }) => access === "deny"), ...privateOutputPaths];
+	const denyEntries = [...privateConfigurationPath, ...protectedPaths.filter(({ access }) => access === "deny"), ...privateOutputPaths, ...homeSecretPathEntries];
 	const minimalDenyEntries = denyEntries.filter((entry, index) => !denyEntries.some((parent, parentIndex) =>
 		parentIndex !== index && pathWithin(parent.path.path, entry.path.path)
 		&& (parent.path.path !== entry.path.path || parentIndex < index)));
@@ -782,26 +869,38 @@ export function createCodexSandboxInvocation(
 		access: commandSandboxMode === "read-only" ? "read" : "write",
 		missing_path_behavior: "skip",
 	};
+	const temporaryRoot = realpathSync.native(tmpdir());
+	const pathEntries: SandboxPathEntry[] = [
+		{ path: { type: "special", value: { kind: "minimal" } }, access: "read" },
+		// Engine 0.159's elevated Windows sandbox refuses a policy that cannot read the drive root. macOS and
+		// Linux already read `/` through the bash installation root; the denies below still apply.
+		...(process.platform === "win32" ? [{ path: { type: "special", value: { kind: "root" } }, access: "read" }] : []),
+		...toolchainReadPaths,
+		workspaceAccess,
+		{ path: { type: "special", value: { kind: "project_roots" } }, access: commandSandboxMode === "read-only" ? "read" : "write" },
+
+		...(commandSandboxMode === "read-only" ? [] : process.platform === "win32" ? [
+			// The pinned Windows special tmpdir expansion drops nested exclusions.
+			{ path: { type: "path", path: temporaryRoot }, access: "write", missing_path_behavior: "skip" },
+		] : [
+			{ path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+			{ path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+		]),
+		...protectedPaths.filter(({ access }) => access !== "deny"),
+		...minimalDenyEntries,
+	];
+	// Only toolchain PATH entries are trimmed; the others stay exactly as listed.
+	const writableTemporaryRoots = commandSandboxMode === "read-only" ? [] : [temporaryRoot, "/tmp", "/private/tmp"];
+	const redundantToolchainReads = new Set<SandboxPathEntry>(toolchainReadPaths.filter((entry) => redundantRead(entry, pathEntries, writableTemporaryRoots)));
 	const state = {
 		permissionProfile: {
 			type: "managed",
 			file_system: {
 				type: "restricted",
 				entries: [
-					{ path: { type: "special", value: { kind: "minimal" } }, access: "read" },
-					...toolchainReadPaths,
-					workspaceAccess,
-					{ path: { type: "special", value: { kind: "project_roots" } }, access: commandSandboxMode === "read-only" ? "read" : "write" },
-
-					...(commandSandboxMode === "read-only" ? [] : process.platform === "win32" ? [
-						// The pinned Windows special tmpdir expansion drops nested exclusions.
-						{ path: { type: "path", path: realpathSync.native(tmpdir()) }, access: "write", missing_path_behavior: "skip" },
-					] : [
-						{ path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
-						{ path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
-					]),
-					...protectedPaths.filter(({ access }) => access !== "deny"),
-					...minimalDenyEntries,
+					...pathEntries.filter((entry) => !redundantToolchainReads.has(entry)),
+					...homeSecretEntries.filter(({ path }) => path.type === "glob_pattern"),
+					...(secretFileDenyEntries(workspaceRoot) ?? []),
 				],
 			},
 			network: "restricted",
@@ -861,7 +960,7 @@ const renderCommandReceipt = (details: Record<string, unknown>, knownSecrets: re
 };
 
 /**
- * Codex's Windows sandbox grants read ACLs from a background helper (skipped while another is
+ * The engine's Windows sandbox grants read ACLs from a background helper (skipped while another is
  * running), so the sandbox account's logon can fail with 267 (invalid directory) or 5 (access
  * denied) before the command starts. The command never ran, so retrying after a short wait is safe.
  */
@@ -903,7 +1002,7 @@ async function runBoundedProcess(
 		const child = spawn(program, args, {
 			cwd,
 			detached: process.platform !== "win32",
-			env: filterSandboxEnvironment(sandboxPath === undefined ? process.env : { ...process.env, PATH: sandboxPath }),
+			env: filterSandboxEnvironment({ ...process.env, ...(sandboxPath === undefined ? {} : { PATH: sandboxPath }), CODEX_HOME: sandboxHome() }),
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
 		});
@@ -962,7 +1061,7 @@ async function runBoundedProcess(
 		child.once("error", terminate);
 		child.once("exit", () => {
 			killedOnExit = true;
-			// After a termination we requested, the Codex launcher and its CLI exit at once while the Linux
+			// After a termination we requested, the engine's launcher and CLI exit at once while the Linux
 			// sandbox helper is still stopping bubblewrap and removing its mount placeholders from the temp
 			// directory; force-killing the group now leaves them behind. The escalation timer still bounds
 			// the wait, and the group is force-killed once the helper releases stdio (on close).
@@ -1001,6 +1100,7 @@ export function runWorkspaceCommandTool(
 		executionMode: "sequential",
 		async execute(toolCallId, { argv, cwd = ".", timeoutSeconds = 120 }, signal) {
 			const commandSandboxMode = options.commandSandboxMode ?? "workspace";
+			const sandboxBinary = resolveSandboxBinary(options.sandboxBinary);
 			const privatePaths = [...(options.privatePaths ?? []), ...outputStore.privatePaths()];
 			const preflightStarted = performance.now();
 			let resolved: Awaited<ReturnType<typeof resolveExistingInsideWorkspace>>;
@@ -1009,12 +1109,15 @@ export function runWorkspaceCommandTool(
 				if (argv.some((argument) => argument.includes("\u0000") || (!options.allowArgumentLineBreaks && /[\r\n]/.test(argument)))) throw new Error("Command arguments cannot contain control line breaks");
 				resolved = await resolveExistingInsideWorkspace(workspaceRoot, cwd, privatePaths);
 				if (!(await lstat(resolved.target)).isDirectory()) throw new Error("Command cwd is not a directory");
-				const sensitivePaths = commandSandboxMode === "full-access" ? [] : await discoverSensitiveWorkspacePaths(resolved.root, signal);
+				// Where the sandbox hides secret files by pattern, commands run without the workspace scan.
+				const sensitivePaths = commandSandboxMode === "full-access" || secretFileDenyEntries(resolved.root) ? [] : await discoverSensitiveWorkspacePaths(resolved.root, signal);
 				if (sensitivePaths.length) throw new Error(`Sandboxed workspace commands are blocked while ${sensitivePaths.length} sensitive path${sensitivePaths.length === 1 ? " is" : "s are"} present; use structured tools or explicitly authorized full-access mode`);
+				if (!existsSync(sandboxBinary)) throw new Error(SANDBOX_INSTALL_HINT);
+				await mkdir(sandboxHome(), { recursive: true, mode: 0o700 });
 				await outputStore.prepare();
 				// The sandbox denies the shared output root; it must exist first (see ensureCommandOutputRoot).
 				if (commandSandboxMode !== "full-access") await ensureCommandOutputRoot();
-				invocation = createCodexSandboxInvocation(resolved.target, normalizeWorkspaceCommandArgv(argv), {
+				invocation = createSandboxInvocation(resolved.target, normalizeWorkspaceCommandArgv(argv), {
 					commandSandboxMode,
 					privatePaths,
 					sandboxWorkspaceRoot: resolved.root,
@@ -1069,7 +1172,7 @@ export function runWorkspaceCommandTool(
 			let changedPaths: string[] | void = undefined;
 			let executionError: unknown;
 			const subprocessStarted = performance.now();
-			try { result = await runSandboxedProcess(() => runBoundedProcess(resolveCodexBinary(options.codexBinary), invocation, resolved.target, timeoutSeconds, outputStore, toolCallId, options.sandboxPath, signal), signal); }
+			try { result = await runSandboxedProcess(() => runBoundedProcess(sandboxBinary, invocation, resolved.target, timeoutSeconds, outputStore, toolCallId, options.sandboxPath, signal), signal); }
 			catch (error) { executionError = error; }
 			const subprocessDurationMs = Math.round((performance.now() - subprocessStarted) * 100) / 100;
 			const afterCheckpointStarted = performance.now();
@@ -1101,7 +1204,7 @@ export function runWorkspaceCommandTool(
 					// they do to a command that settled on its own; they key on the confining sandbox.
 					...(interruptedWithoutChanges ? {
 						changedPaths: changedPaths ?? [],
-						sandbox: "codex-native",
+						sandbox: "codetonomy-native",
 						filesystem: commandSandboxMode,
 						network: "disabled",
 					} : {}),
@@ -1134,7 +1237,7 @@ export function runWorkspaceCommandTool(
 				executionOutcome,
 				...result.receipt,
 				changedPaths: changedPaths ?? [],
-				sandbox: "codex-native",
+				sandbox: "codetonomy-native",
 				filesystem: commandSandboxMode,
 				network: commandSandboxMode === "full-access" ? "enabled" : "disabled",
 				rewindCoverage: commandSandboxMode === "read-only" ? "not-required" : observer ? observer.coverage?.() ?? "captured" : "incomplete",

@@ -6,7 +6,7 @@ import test from "node:test";
 import { createHarness } from "../packages/runtime/src/index.ts";
 import { RunCheckpoint, rewindCheckpoint } from "../packages/runtime/src/checkpoint.ts";
 import { compileTask } from "../packages/task-compiler/src/index.ts";
-import { bashTool, CommandOutputStore, resolveCodexBinary, runWorkspaceCommandTool, writeWorkspaceTool } from "../packages/tools/src/index.ts";
+import { bashTool, CommandOutputStore, resolveSandboxBinary, runWorkspaceCommandTool, secretFileDenyEntries, writeWorkspaceTool } from "../packages/tools/src/index.ts";
 import { verifyOutput } from "../packages/verifiers/src/index.ts";
 import { tempDirs } from "./support/temp.ts";
 
@@ -17,6 +17,13 @@ const commandOutputStore = (workspaceRoot: string) => new CommandOutputStore({
 	outputDirectory: join(workspaceRoot, `.command-output-${randomUUID()}`),
 });
 
+// Where the sandbox hides secret files by pattern (macOS, Linux) commands run without the scan;
+// elsewhere the preflight scan still refuses them.
+const expectSecretHandling = async (workspace: string, execute: () => Promise<unknown>): Promise<void> => {
+	if (secretFileDenyEntries(await realpath(workspace))) await execute();
+	else await assert.rejects(execute, /commands are blocked.*sensitive path/);
+};
+
 test("sensitive command preflight checks ignored directories and linked directories", async (t) => {
 	const root = await temporaryDirectory("codetonomy-sensitive-regression-");
 	for (const directory of ["node_modules", ".git", ".codetonomy", "dist", ".reference-repos"]) {
@@ -24,9 +31,9 @@ test("sensitive command preflight checks ignored directories and linked director
 		await mkdir(join(workspace, directory), { recursive: true });
 		await writeFile(join(workspace, directory, ".env"), "DUMMY=fixture");
 		for (const commandSandboxMode of ["workspace", "read-only"] as const) {
-			await assert.rejects(() => runWorkspaceCommandTool(workspace, {
-				codexBinary: process.execPath, commandSandboxMode, outputStore: commandOutputStore(workspace),
-			}).execute("blocked", { argv: ["ignored"] }), /commands are blocked.*sensitive path/);
+			await expectSecretHandling(workspace, () => runWorkspaceCommandTool(workspace, {
+				sandboxBinary: process.execPath, commandSandboxMode, outputStore: commandOutputStore(workspace),
+			}).execute("blocked", { argv: ["ignored"] }));
 		}
 	}
 	const workspace = join(root, "linked-workspace");
@@ -34,12 +41,12 @@ test("sensitive command preflight checks ignored directories and linked director
 	await mkdir(workspace); await mkdir(target);
 	await writeFile(join(target, ".env"), "DUMMY=fixture");
 	await symlink(target, join(workspace, "dependency"), process.platform === "win32" ? "junction" : "dir");
-	await assert.rejects(() => runWorkspaceCommandTool(workspace, { codexBinary: process.execPath, outputStore: commandOutputStore(workspace) })
-		.execute("linked", { argv: ["ignored"] }), /commands are blocked.*sensitive path/);
+	await expectSecretHandling(workspace, () => runWorkspaceCommandTool(workspace, { sandboxBinary: process.execPath, outputStore: commandOutputStore(workspace) })
+		.execute("linked", { argv: ["ignored"] }));
 	await unlink(join(target, ".env"));
 	await symlink(workspace, join(target, "cycle"), process.platform === "win32" ? "junction" : "dir");
 	await writeFile(join(workspace, "sandbox"), "process.exit(0);");
-	assert.equal((await runWorkspaceCommandTool(workspace, { codexBinary: process.execPath, outputStore: commandOutputStore(workspace) })
+	assert.equal((await runWorkspaceCommandTool(workspace, { sandboxBinary: process.execPath, outputStore: commandOutputStore(workspace) })
 		.execute("cycle", { argv: ["ignored"] })).details.exitCode, 0);
 });
 
@@ -73,7 +80,7 @@ test("rewind retains the original preimage after deletion and recreation across 
 test("native Bash provides exact evidence only for a parsed single command", async (t) => {
 	const root = await temporaryDirectory("codetonomy-bash-evidence-");
 	await writeFile(join(root, "sandbox"), "process.exit(0);");
-	const tool = bashTool(root, { codexBinary: process.execPath, outputStore: commandOutputStore(root) });
+	const tool = bashTool(root, { sandboxBinary: process.execPath, outputStore: commandOutputStore(root) });
 	for (const command of ["npm test", "npm run test", "npm test || true", "echo npm test"]) {
 		const result = await tool.execute(command, { command });
 		const details = result.details as { argv: string[]; semanticArgv?: string[]; exitCode: number };
@@ -95,11 +102,11 @@ test("native Bash provides exact evidence only for a parsed single command", asy
 
 test("runtime accepts successful native Bash command evidence without repair", async (t) => {
 	const root = await temporaryDirectory("codetonomy-bash-runtime-");
-	const previousCodex = process.env.CODETONOMY_CODEX_BIN;
-	process.env.CODETONOMY_CODEX_BIN = process.execPath;
+	const previousSandbox = process.env.CODETONOMY_SANDBOX_BIN;
+	process.env.CODETONOMY_SANDBOX_BIN = process.execPath;
 	t.after(() => {
-		if (previousCodex === undefined) delete process.env.CODETONOMY_CODEX_BIN;
-		else process.env.CODETONOMY_CODEX_BIN = previousCodex;
+		if (previousSandbox === undefined) delete process.env.CODETONOMY_SANDBOX_BIN;
+		else process.env.CODETONOMY_SANDBOX_BIN = previousSandbox;
 	});
 	await writeFile(join(root, "sandbox"), "process.exit(0);");
 	let requests = 0;
@@ -153,7 +160,7 @@ test("structured writes protect runtime directories before creating parents, inc
 	assert.equal(settlements, 1);
 	await mkdir(join(root, "runtime-private"));
 	const outputStore = new CommandOutputStore({ workspaceRoot: root });
-	await assert.rejects(() => runWorkspaceCommandTool(root, { codexBinary: process.execPath, outputStore, privatePaths: [join(root, "runtime-private")] })
+	await assert.rejects(() => runWorkspaceCommandTool(root, { sandboxBinary: process.execPath, outputStore, privatePaths: [join(root, "runtime-private")] })
 		.execute("private-cwd", { argv: ["ignored"], cwd: "runtime-private" }), /private runtime state/);
 });
 
@@ -161,19 +168,19 @@ test("worker discovery ignores project-local executables unless explicitly confi
 	const root = await temporaryDirectory("codetonomy-runtime-discovery-");
 	// Windows taskkill can briefly retain the worker's inherited working directory.
 	const oldCwd = process.cwd();
-	const keys = ["CODETONOMY_CODEX_BIN", "CODETONOMY_HOME", "CODETONOMY_WORKER_ROOT"];
+	const keys = ["CODETONOMY_SANDBOX_BIN", "CODETONOMY_HOME", "CODETONOMY_WORKER_ROOT"];
 	const oldEnvironment = keys.map((key) => process.env[key]);
-	const fakeCodex = join(root, ".codetonomy/workers/codex/node_modules/.bin/codex");
-	await mkdir(dirname(fakeCodex), { recursive: true });
-	await writeFile(fakeCodex, "inert test candidate");
+	const fakeSandbox = join(root, ".codetonomy/workers/sandbox/node_modules/.bin/codex");
+	await mkdir(dirname(fakeSandbox), { recursive: true });
+	await writeFile(fakeSandbox, "inert test candidate");
 	try {
 		for (const key of keys) delete process.env[key];
 		process.chdir(root);
-		assert.notEqual(resolveCodexBinary(), fakeCodex);
+		assert.notEqual(resolveSandboxBinary(), fakeSandbox);
 		await mkdir(join(root, "nested"));
 		process.chdir(join(root, "nested"));
-		assert.notEqual(resolveCodexBinary(), fakeCodex);
-		assert.equal(resolveCodexBinary(fakeCodex), fakeCodex);
+		assert.notEqual(resolveSandboxBinary(), fakeSandbox);
+		assert.equal(resolveSandboxBinary(fakeSandbox), fakeSandbox);
 	} finally {
 		process.chdir(oldCwd);
 		keys.forEach((key, index) => oldEnvironment[index] === undefined ? delete process.env[key] : process.env[key] = oldEnvironment[index]);
@@ -184,7 +191,7 @@ test("read-only commands skip mutation capture; writable checkpoints track actua
 	const root = await temporaryDirectory("codetonomy-checkpoint-evidence-");
 	await writeFile(join(root, "sandbox"), "process.exit(0);");
 	let captures = 0;
-	const readOnly = await runWorkspaceCommandTool(root, { codexBinary: process.execPath, commandSandboxMode: "read-only", outputStore: commandOutputStore(root), observer: { before: async () => {}, after: async () => {}, beforeWorkspace: async () => { captures++; }, afterWorkspace: async () => { captures++; } } }).execute("read-only", { argv: ["ignored"] });
+	const readOnly = await runWorkspaceCommandTool(root, { sandboxBinary: process.execPath, commandSandboxMode: "read-only", outputStore: commandOutputStore(root), observer: { before: async () => {}, after: async () => {}, beforeWorkspace: async () => { captures++; }, afterWorkspace: async () => { captures++; } } }).execute("read-only", { argv: ["ignored"] });
 	assert.equal(captures, 0);
 	assert.equal((readOnly.details as Record<string, unknown>).checkpointCount, 0);
 	assert.equal((readOnly.details as Record<string, unknown>).mutationRisk, "none");
@@ -203,7 +210,7 @@ test("read-only commands skip mutation capture; writable checkpoints track actua
 	assert.equal(await readFile(join(root, "existing.txt"), "utf8"), "original");
 });
 
-test("npm Codex launchers resolve to the native worker before PATH restriction", async (t) => {
+test("npm sandbox engine launchers resolve to the native binary before PATH restriction", async (t) => {
 	const root = await temporaryDirectory("codetonomy-npm-worker-");
 	const launcher = join(root, "node_modules/@openai/codex/bin/codex.js");
 	const platformPackage = join(root, "node_modules/@openai", `codex-${process.platform}-${process.arch}`);
@@ -213,5 +220,5 @@ test("npm Codex launchers resolve to the native worker before PATH restriction",
 	await writeFile(launcher, "#!/usr/bin/env node\n");
 	await writeFile(join(platformPackage, "package.json"), "{}");
 	await writeFile(binary, "native test candidate");
-	assert.equal(resolveCodexBinary(launcher), await realpath(binary));
+	assert.equal(resolveSandboxBinary(launcher), await realpath(binary));
 });

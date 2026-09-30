@@ -7,13 +7,13 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { skipUnless } from "./support/environment.ts";
-import { bashTool, CommandOutputStore, createNativeBashArgv, createCodexSandboxInvocation, normalizeWorkspaceCommandArgv, planBashCommand, resolveCodexBinary, runWorkspaceCommandTool } from "../packages/tools/src/index.ts";
+import { bashTool, CommandOutputStore, createNativeBashArgv, createSandboxInvocation, normalizeWorkspaceCommandArgv, planBashCommand, resolveSandboxBinary, runWorkspaceCommandTool } from "../packages/tools/src/index.ts";
 
-const codex = resolveCodexBinary();
-const available = spawnSync(codex, ["--version"], { stdio: "ignore" }).status === 0;
+const sandboxBinary = resolveSandboxBinary();
+const available = spawnSync(sandboxBinary, ["--version"], { stdio: "ignore" }).status === 0;
 const sandboxRequired = process.env.CI === "true" || process.env.CODETONOMY_REQUIRE_SANDBOX === "1";
-test("native Codex sandbox permits workspace writes and blocks escape and network", { skip: !available && !sandboxRequired }, async (t) => {
-	assert.equal(available, true, `Codex sandbox binary is unavailable: ${codex}`);
+test("native Codetonomy sandbox permits workspace writes and blocks escape and network", { skip: !available && !sandboxRequired }, async (t) => {
+	assert.equal(available, true, `Codetonomy sandbox binary is unavailable: ${sandboxBinary}`);
 	const parent = await mkdtemp(join(process.cwd(), ".codetonomy-sandbox-"));
 	const workspace = join(parent, "workspace");
 	const configurationDirectory = join(homedir(), `.codetonomy-sandbox-config-${randomUUID()}`);
@@ -31,13 +31,13 @@ test("native Codex sandbox permits workspace writes and blocks escape and networ
 	const invocation = (argv: string[]) => {
 		const previous = process.env.CODETONOMY_HOME;
 		process.env.CODETONOMY_HOME = configurationDirectory;
-		try { return createCodexSandboxInvocation(workspace, argv); }
+		try { return createSandboxInvocation(workspace, argv); }
 		finally {
 			if (previous === undefined) delete process.env.CODETONOMY_HOME;
 			else process.env.CODETONOMY_HOME = previous;
 		}
 	};
-	const run = (argv: string[]) => spawnSync(codex, invocation(argv), {
+	const run = (argv: string[]) => spawnSync(sandboxBinary, invocation(argv), {
 		cwd: workspace,
 		encoding: "utf8",
 		timeout: 10_000,
@@ -74,41 +74,41 @@ test("native Codex sandbox permits workspace writes and blocks escape and networ
 	}
 });
 
-test("native Codex full-access invocation serializes the unrestricted profile", { skip: !available && !sandboxRequired }, () => {
-	assert.equal(available, true, `Codex sandbox binary is unavailable: ${codex}`);
+test("native Codetonomy sandbox full-access invocation serializes the unrestricted profile", { skip: !available && !sandboxRequired }, () => {
+	assert.equal(available, true, `Codetonomy sandbox binary is unavailable: ${sandboxBinary}`);
 	const root = tmpdir();
 	const command = [process.execPath, "-e", "console.log('ok')"];
-	const invocation = createCodexSandboxInvocation(root, command, { commandSandboxMode: "full-access" });
+	const invocation = createSandboxInvocation(root, command, { commandSandboxMode: "full-access" });
 	const state = JSON.parse(invocation[2]!) as { permissionProfile: { type: string } };
 	assert.equal(state.permissionProfile.type, "disabled");
 	assert.equal(invocation.includes("--sandbox-state-disable-network"), false);
 	assert.deepEqual(invocation.slice(-4), ["--", ...command]);
-	const executed = spawnSync(codex, invocation, { cwd: root, encoding: "utf8", timeout: 10_000 });
+	const executed = spawnSync(sandboxBinary, invocation, { cwd: root, encoding: "utf8", timeout: 10_000 });
 	assert.equal(executed.status, 0, executed.stderr || executed.stdout);
 	assert.match(executed.stdout, /ok/);
 });
 
-test("native Codex read-only sandbox permits inspection and blocks workspace writes", { skip: !available && !sandboxRequired }, async (t) => {
-	assert.equal(available, true, `Codex sandbox binary is unavailable: ${codex}`);
+test("native Codetonomy read-only sandbox permits inspection and blocks workspace writes", { skip: !available && !sandboxRequired }, async (t) => {
+	assert.equal(available, true, `Codetonomy sandbox binary is unavailable: ${sandboxBinary}`);
 	const parent = await mkdtemp(join(process.platform === "darwin" ? homedir() : process.cwd(), ".codetonomy-read-only-sandbox-"));
 	const workspace = join(parent, "workspace");
 	await mkdir(workspace);
 	await writeFile(join(workspace, "evidence.txt"), "readable\n");
 	t.after(() => rm(parent, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
-	const invocation = (argv: string[]) => createCodexSandboxInvocation(workspace, argv, { commandSandboxMode: "read-only" });
+	const invocation = (argv: string[]) => createSandboxInvocation(workspace, argv, { commandSandboxMode: "read-only" });
 	const state = JSON.parse(invocation([process.execPath])[2]!) as {
 		permissionProfile: { file_system: { entries: Array<{ access: string; path: { value?: { kind?: string } } }> } };
 	};
 	assert.ok(state.permissionProfile.file_system.entries.some(({ access, path }) => access === "read" && path.value?.kind === "project_roots"));
 
-	const inspected = spawnSync(codex, invocation([process.execPath, "-e", "process.exit(require('node:fs').readFileSync('evidence.txt','utf8') === 'readable\\n' ? 0 : 2)"]), {
+	const inspected = spawnSync(sandboxBinary, invocation([process.execPath, "-e", "process.exit(require('node:fs').readFileSync('evidence.txt','utf8') === 'readable\\n' ? 0 : 2)"]), {
 		cwd: workspace,
 		encoding: "utf8",
 		timeout: 10_000,
 	});
 	assert.equal(inspected.status, 0, inspected.stderr || inspected.stdout);
 
-	const write = spawnSync(codex, invocation([process.execPath, "-e", "require('node:fs').writeFileSync('forbidden.txt','no')"]), {
+	const write = spawnSync(sandboxBinary, invocation([process.execPath, "-e", "require('node:fs').writeFileSync('forbidden.txt','no')"]), {
 		cwd: workspace,
 		encoding: "utf8",
 		timeout: 10_000,
@@ -123,9 +123,9 @@ test("macOS platform-default scratch access cannot masquerade as workspace isola
 	await writeFile(join(root, "a.txt"), "evidence");
 	assert.equal(planBashCommand({ command: "cat a.txt" }, root).readOnly, false);
 	for (const workspace of [root, root.replace("/private/tmp/", "/tmp/")]) {
-		assert.throws(() => createCodexSandboxInvocation(workspace, [process.execPath], { commandSandboxMode: "read-only" }), /cannot enforce a read-only workspace/);
+		assert.throws(() => createSandboxInvocation(workspace, [process.execPath], { commandSandboxMode: "read-only" }), /cannot enforce a read-only workspace/);
 	}
-	assert.throws(() => createCodexSandboxInvocation(homedir(), [process.execPath], { privatePaths: [root] }), /overlap private state/);
+	assert.throws(() => createSandboxInvocation(homedir(), [process.execPath], { privatePaths: [root] }), /overlap private state/);
 });
 
 test("Bash rg fallback preserves matches and read-only enforcement", { skip: !available && !sandboxRequired }, async t => {
@@ -137,7 +137,7 @@ test("Bash rg fallback preserves matches and read-only enforcement", { skip: !av
  t.after(() => rm(parent, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
  await writeFile(join(root, "evidence.txt"), "alpha\nbeta\n");
  const outputStore = new CommandOutputStore({ workspaceRoot: root, outputDirectory: join(root, "command-output") });
- const tool = bashTool(root, { commandSandboxMode: "read-only", codexBinary: codex, outputStore });
+ const tool = bashTool(root, { commandSandboxMode: "read-only", sandboxBinary, outputStore });
  const matched = await tool.execute("patterns", { command: "rg -F alpha evidence.txt" });
  assert.equal((matched.details as { exitCode: number }).exitCode, 0, JSON.stringify(matched));
  assert.equal(matched.content[0]?.type === "text" ? matched.content[0].text : "", "alpha\n");
@@ -158,7 +158,7 @@ test("Bash rg fallback preserves matches and read-only enforcement", { skip: !av
 });
 
 test("workspace sandbox cannot modify the private command-output store", { skip: !available && !sandboxRequired }, async (t) => {
-	assert.equal(available, true, `Codex sandbox binary is unavailable: ${codex}`);
+	assert.equal(available, true, `Codetonomy sandbox binary is unavailable: ${sandboxBinary}`);
 	const workspace = await mkdtemp(join(tmpdir(), "codetonomy-output-deny-workspace-"));
 	const outputRoot = await mkdtemp(join(tmpdir(), "codetonomy-output-deny-private-"));
 	const outputStore = new CommandOutputStore({ workspaceRoot: workspace, outputDirectory: join(outputRoot, "capture") });
@@ -167,7 +167,7 @@ test("workspace sandbox cannot modify the private command-output store", { skip:
 		await rm(workspace, { recursive: true, force: true });
 		await rm(outputRoot, { recursive: true, force: true });
 	});
-	const result = await runWorkspaceCommandTool(workspace, { codexBinary: codex, commandSandboxMode: "workspace", outputStore }).execute("deny-output", {
+	const result = await runWorkspaceCommandTool(workspace, { sandboxBinary, commandSandboxMode: "workspace", outputStore }).execute("deny-output", {
 		argv: [process.execPath, "-e", `require('node:fs').writeFileSync(${JSON.stringify(attackerPath)}, 'tampered')`],
 	});
 	assert.notEqual((result.details as Record<string, unknown>).exitCode, 0);
@@ -184,7 +184,7 @@ test("workspace sandbox cannot modify the private command-output store", { skip:
 		await owner.discard().catch(() => undefined);
 		await other.discard().catch(() => undefined);
 	});
-	const crossRun = await runWorkspaceCommandTool(workspace, { codexBinary: codex, commandSandboxMode: "workspace", outputStore: other }).execute("cross-run", {
+	const crossRun = await runWorkspaceCommandTool(workspace, { sandboxBinary, commandSandboxMode: "workspace", outputStore: other }).execute("cross-run", {
 		argv: [process.execPath, "-e", `process.exit(require('node:fs').readFileSync(${JSON.stringify(sealedPath)}, 'utf8') === 'cross-run secret' ? 0 : 2)`],
 	});
 	// On Windows this relies on the store's owner-only DACL rather than sandbox read denials (#19).
@@ -194,7 +194,7 @@ test("workspace sandbox cannot modify the private command-output store", { skip:
 test("sandbox policy keeps parent denials without redundant child mounts", () => {
 	const workspace = homedir();
 	const privateRoot = join(workspace, ".codetonomy-policy-fixture");
-	const args = createCodexSandboxInvocation(workspace, [process.execPath], { privatePaths: [privateRoot, join(privateRoot, "capture"), join(privateRoot, "capture/manifest.json"), privateRoot] });
+	const args = createSandboxInvocation(workspace, [process.execPath], { privatePaths: [privateRoot, join(privateRoot, "capture"), join(privateRoot, "capture/manifest.json"), privateRoot] });
 	const state = JSON.parse(args[args.indexOf("--sandbox-state-json") + 1]!);
 	const denials = state.permissionProfile.file_system.entries.filter((entry: { access: string }) => entry.access === "deny").map((entry: { path: { path: string } }) => entry.path.path);
 	if (process.platform === "win32") {
@@ -306,7 +306,7 @@ test("sandboxed commands deny the default configuration directory when CODETONOM
 	const previous = process.env.CODETONOMY_HOME;
 	delete process.env.CODETONOMY_HOME;
 	try {
-		const args = createCodexSandboxInvocation(process.cwd(), [process.execPath]);
+		const args = createSandboxInvocation(process.cwd(), [process.execPath]);
 		const state = JSON.parse(args[args.indexOf("--sandbox-state-json") + 1]!);
 		const denials = state.permissionProfile.file_system.entries.filter((entry: { access: string }) => entry.access === "deny").map((entry: { path: { path: string } }) => entry.path.path);
 		assert.ok(denials.includes(join(homedir(), ".codetonomy")), JSON.stringify(denials));

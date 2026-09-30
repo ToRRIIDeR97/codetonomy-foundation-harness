@@ -69,7 +69,7 @@ test("workspace command cancellation preserves evidence and terminates descendan
 	const controller = new AbortController();
 	const outputStore = new CommandOutputStore({ workspaceRoot: workspace, outputDirectory: join(workspace, "command-output") });
 	try {
-		const execution = runWorkspaceCommandTool(workspace, { codexBinary: process.execPath, commandSandboxMode: "read-only", outputStore }).execute("cancelled", { argv: ["ignored"], timeoutSeconds: 30 }, controller.signal);
+		const execution = runWorkspaceCommandTool(workspace, { sandboxBinary: process.execPath, commandSandboxMode: "read-only", outputStore }).execute("cancelled", { argv: ["ignored"], timeoutSeconds: 30 }, controller.signal);
 		const grandchildPid = await readPid(grandchildPath);
 		controller.abort();
 		await assert.rejects(execution, (error: unknown) => {

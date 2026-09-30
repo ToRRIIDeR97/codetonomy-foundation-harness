@@ -40,6 +40,7 @@ import { RunTrace } from "@agent-harness/telemetry";
 import { MAX_CONVERSATION_PROMPT_BYTES, MAX_SESSION_BYTES, MAX_SESSION_TURNS, promptTokenCount, cacheReadRatio, validateConversationTranscript, type ConversationTranscript } from "@agent-harness/contracts";
 import { BashCommandPlanner, bashOperationHasPreciseCommand, bashPermissionTarget, bashPermissionTargets, bashPlanUsesReadOnlySandbox, CODING_TOOL_IDS, CommandOutputStore, createNativeBashArgv, normalizeWriteClaim, resolveToolCacheDefinitions, resolveTools, TOOL_OUTPUT_MANIFEST, moduleTools as listModuleTools, type BashCommandPlan, type BashToolArguments, type CommandMutationRisk, type CommandResultKind, type HarnessModule, type HarnessModuleRunContext, type HarnessModuleTool } from "@agent-harness/tools";
 export type { HarnessModule, HarnessModuleRunContext, HarnessModuleTool, HarnessModuleToolContext, HarnessModuleToolDefinition, RecalledContext } from "@agent-harness/tools";
+export { SANDBOX_INSTALL_HINT, sandboxInstalled } from "@agent-harness/tools";
 import { commandMatches, verifyOutput } from "@agent-harness/verifiers";
 import { captureCacheShape, classifyCacheMiss, commonPrefixBytes, deriveCacheAffinityId, lookupAndStoreCacheShape, observeWireRequest, type WireRequestObservation } from "./cache-shape.js";
 import { RunCheckpoint, writeRuntimeFileAtomically } from "./checkpoint.js";
@@ -1155,7 +1156,7 @@ export function createHarness(): AgentHarness {
 				const preciseCommands = new Map<string, string[]>();
 				const requiredValidationCommands = compiledTask.acceptanceCriteria.flatMap(c => c.required && c.command && PACKAGE_COMMANDS.has(c.command[0]!.split(/[\\/]/).at(-1)!) && DIRECT_SUBCOMMANDS.has(c.command[1] === "run" ? c.command[2]! : c.command[1]!) ? [c.command] : []);
 				const commandRecovery = (callId: string, details?: Record<string, unknown>) => {
-					if (permissionMode === "full-access" || details?.sandbox !== "codex-native") return undefined;
+					if (permissionMode === "full-access" || details?.sandbox !== "codetonomy-native") return undefined;
 					const failedCommand = preciseCommands.get(callId);
 					const failedRequired = failedCommand && requiredValidationCommands.find(command => commandMatches(failedCommand, command));
 					const retryCommand = failedRequired ?? requiredValidationCommands[0];
